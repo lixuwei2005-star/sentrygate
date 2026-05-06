@@ -1,61 +1,113 @@
 # SentryGate
 
-SentryGate is a local MCP security gateway prototype that masks secrets, scores
-risk, audits tool calls, and blocks or requires approval for risky local
-operations.
+SentryGate is a local MCP security gateway prototype for selected tool calls.
+It demonstrates deterministic risk scoring, privacy masking, approval gating,
+hard blocking, and masked audit events for operations routed through its own MCP
+server.
 
-## What Problem It Solves
+## Quick Demo
 
-Coding agents can read files, write files, and run commands. That makes local
-development workflows powerful, but it also creates sharp edges:
+Run the local demo from the `backend` directory:
 
-- Secrets from files or command output can be returned into an agent context.
-- File writes can change a workspace before a human reviews the action.
-- Dangerous commands can damage files or leak data.
-- Tool activity can be hard to inspect after the fact.
+```powershell
+cd backend
+uv run python scripts/demo_sentrygate.py
+```
 
-SentryGate explores a local MCP boundary where file and command operations are
-scored, masked, and audited before results are returned to an MCP-compatible
-agent.
+The demo creates a temporary workspace, uses fake secrets only, and calls
+`SafeToolService` directly. It does not require Codex or a running MCP client.
+It shows:
 
-## Architecture
+- Safe file reads with masked secrets.
+- Sensitive `.env` reads blocked.
+- Writes held at `require_approval`.
+- Directory listings allowed inside the demo workspace.
+- Normal commands held at `require_approval`.
+- Dangerous command patterns blocked.
+- Masked audit events printed at the end.
+
+See [docs/demo-output.md](docs/demo-output.md) for sample output and scenario
+notes.
+
+## What I Built
+
+I built a local MCP security gateway prototype that sits between an
+MCP-compatible coding agent and selected local tools.
+
+Current implemented pieces:
+
+- An MCP server exposing SentryGate tools for file reads, file writes,
+  directory listings, and command requests.
+- `SafeToolService`, a central wrapper that performs workspace checks, risk
+  decisions, execution decisions, privacy masking, and audit logging.
+- Rule-based risk scoring with `allow`, `block`, and `require_approval`
+  decisions.
+- Privacy masking before tool output is returned.
+- In-memory audit events with masked summaries.
+- Optional local LM Studio semantic review for eligible medium-risk calls,
+  disabled unless configured and unable to override deterministic hard blocks.
+
+This project is designed as an internship portfolio project and local prototype,
+not as a production security product.
+
+## What It Protects
+
+SentryGate protects tool calls routed through the SentryGate MCP server.
+
+Protected workflows should use:
+
+- `sentry_read_file`
+- `sentry_write_file`
+- `sentry_list_directory`
+- `sentry_run_command`
+
+For those SentryGate-routed calls, the configured workspace root is the
+filesystem boundary. SentryGate can score requests, block sensitive operations,
+hold approval-required operations without executing them, mask detected secrets
+before returning output, and record masked audit events for local inspection.
+
+## What It Does Not Protect
+
+SentryGate does not intercept or control Codex built-in internal tools.
+
+It also does not protect:
+
+- Direct shell access outside SentryGate tools.
+- Direct filesystem access outside SentryGate tools.
+- Operations routed through other MCP servers.
+- The operating system as a full sandbox.
+- Container, VM, kernel, EDR, antivirus, or cloud security boundaries.
+- Production approval workflows.
+- Durable enterprise audit governance.
+- Every possible secret format or risky command form.
+
+Broad workspace roots create broad access boundaries. Use the narrowest
+practical workspace root for protected demos or experiments.
+
+## Current Architecture
 
 ```text
 Codex / MCP Agent -> SentryGate MCP Server -> SafeToolService -> RiskScorer + PrivacyMasker + AuditStore
 ```
 
-The SentryGate MCP server exposes protected tools for file reads, file writes,
-directory listings, and command requests. The MCP server is a thin adapter over
-`SafeToolService`, which performs workspace checks, risk decisions, execution,
-privacy masking, and audit logging.
+The SentryGate MCP server is a thin adapter over `SafeToolService`.
+`SafeToolService` owns workspace checks, risk decisions, execution decisions,
+privacy masking, and audit logging for SentryGate tools.
 
 `RiskScorer` classifies each request as `allow`, `block`, or
 `require_approval`. `PrivacyMasker` replaces detected secrets with stable mask
 tokens before output is returned. `AuditStore` records masked audit events for
 local inspection.
 
-## Important Boundary
+When LM Studio review is enabled, it is an optional local semantic review layer
+for eligible medium-risk calls:
 
-SentryGate only protects tool calls routed through its MCP server.
+```text
+RiskScorer -> optional LM Studio review for medium-risk calls -> conservative merge
+```
 
-It does not intercept Codex built-in internal tools.
-
-SentryGate is not a full operating-system sandbox. Direct filesystem, shell, or
-other internal Codex tools are outside SentryGate's enforcement boundary. For
-protected workflows, configure the agent to call SentryGate tools such as
-`sentry_read_file`, `sentry_write_file`, `sentry_list_directory`, and
-`sentry_run_command`.
-
-The configured workspace root is the filesystem boundary SentryGate enforces for
-its own tools. Use the narrowest practical workspace root for the task.
-
-## Current Features
-
-- Privacy masking
-- Risk scoring
-- Safe tool wrappers
-- In-memory audit logs
-- MCP server integration
+Deterministic rules run first. LM Studio cannot reduce risk, cannot turn
+`require_approval` into `allow`, and cannot override a deterministic hard block.
 
 ## Run Backend Checks
 
@@ -119,26 +171,23 @@ Adapt this shape to your local Codex MCP configuration mechanism. SentryGate
 protection applies only when the agent routes protected operations through the
 SentryGate MCP tools.
 
-## Local Demo
+## Roadmap
 
-Run the local demo from the `backend` directory:
+Possible future work:
 
-```powershell
-cd backend
-uv run python scripts/demo_sentrygate.py
-```
+- Durable audit storage.
+- Human approval UI or approval API.
+- Richer policy configuration.
+- More robust command parsing coverage.
+- Frontend audit dashboard.
+- More complete integration examples for MCP clients.
+- Optional deployment hardening experiments.
 
-The demo creates a temporary workspace, uses `SafeToolService` directly, and
-shows allow, block, and require-approval decisions without requiring Codex or a
-running MCP server.
-
-The demo uses SafeToolService directly and does not require Codex or a running
-MCP server.
+These are roadmap ideas, not claims about the current prototype.
 
 ## Security Limitations
 
-SentryGate is a local prototype, not a production-grade enterprise security
-product.
+SentryGate is a local prototype, not a production-grade security product.
 
 - It protects only MCP calls routed through the SentryGate MCP server.
 - It does not intercept Codex built-in internal tools.
@@ -147,5 +196,4 @@ product.
 - Current approval behavior returns `require_approval`; there is no human
   approval UI or delayed execution workflow yet.
 - Rule-based detection can miss novel command forms or secret formats.
-- Broad workspace roots create broad access boundaries.
 - Demo behavior with fake data is not proof of production-grade isolation.
