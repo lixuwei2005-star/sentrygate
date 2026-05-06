@@ -5,6 +5,7 @@ description = "Local MCP security gateway backend for SentryGate."
 requires-python = ">=3.11"
 dependencies = [
     "fastapi",
+    "mcp>=1.27.0",
     "pydantic",
     "uvicorn[standard]",
 ]
