@@ -49,6 +49,9 @@ ENV_SECRET_KEY_PATTERN = re.compile(
 MASK_TOKEN_PATTERN = re.compile(r"^\[[A-Z_]+_\d{3}\]$")
 
 
+# Order is intentional and load-bearing: structural or longer secrets are
+# masked first so that contained substrings (e.g. emails inside database
+# URLs) are not double-masked by a later, narrower pattern.
 GENERAL_PATTERNS: tuple[SensitivePattern, ...] = (
     SensitivePattern(SecretKind.PRIVATE_KEY, PRIVATE_KEY_PATTERN),
     SensitivePattern(SecretKind.DATABASE_URL, DATABASE_URL_PATTERN),
