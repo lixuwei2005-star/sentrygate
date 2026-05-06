@@ -310,6 +310,113 @@ def test_raw_secrets_are_not_sent_to_lmstudio_input(tmp_path: Path) -> None:
     assert "[API_KEY_001]" in summary
 
 
+def test_lower_model_score_does_not_reduce_final_score() -> None:
+    original = _medium_risk_result()
+    client = FakeReviewClient(
+        LMStudioReviewOutput(
+            risk_score=20,
+            decision="require_approval",
+            reason="model thought lower",
+        )
+    )
+    reviewer = LMStudioRiskReviewer(
+        config=LMStudioReviewConfig(enabled=True),
+        client=client,
+    )
+
+    result = reviewer.review_risk(
+        ToolCall(tool_name="run_command", arguments={"command": "pytest"}),
+        original,
+        "command=pytest",
+    )
+
+    assert result.risk_score == original.risk_score
+    assert result.decision == "require_approval"
+
+
+def test_model_score_at_or_above_75_escalates_to_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_run(*args: object, **kwargs: object) -> object:
+        raise AssertionError("subprocess.run should not execute")
+
+    monkeypatch.setattr("app.tools.safe_tools.subprocess.run", fail_run)
+    client = FakeReviewClient(
+        LMStudioReviewOutput(
+            risk_score=80,
+            decision="require_approval",
+            reason="elevated semantic risk",
+        )
+    )
+    reviewer = LMStudioRiskReviewer(
+        config=LMStudioReviewConfig(enabled=True),
+        client=client,
+    )
+    store = InMemoryAuditStore()
+    service = SafeToolService(
+        workspace_root=tmp_path,
+        audit_store=store,
+        risk_reviewer=reviewer,
+    )
+
+    result = service.sentry_run_command("pytest --version")
+
+    assert result.decision == "block"
+    assert result.risk_score == 80
+    assert result.error == "operation_blocked"
+    event = store.list_events()[0]
+    assert event.decision == "block"
+    assert event.risk_score == 80
+    assert event.executed is False
+
+
+def test_review_reason_with_fake_secret_is_masked_in_result_and_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_run(*args: object, **kwargs: object) -> object:
+        raise AssertionError("subprocess.run should not execute")
+
+    monkeypatch.setattr("app.tools.safe_tools.subprocess.run", fail_run)
+    fake_secret = "sk-fakeReasonSecret1234567890"
+    client = FakeReviewClient(
+        LMStudioReviewOutput(
+            risk_score=65,
+            decision="require_approval",
+            reason=f"model echoed credential {fake_secret}",
+        )
+    )
+    reviewer = LMStudioRiskReviewer(
+        config=LMStudioReviewConfig(enabled=True),
+        client=client,
+    )
+    store = InMemoryAuditStore()
+    service = SafeToolService(
+        workspace_root=tmp_path,
+        audit_store=store,
+        risk_reviewer=reviewer,
+    )
+
+    result = service.sentry_run_command("pytest --version")
+
+    assert result.decision == "require_approval"
+    semantic_reasons = [
+        reason
+        for reason in result.reasons
+        if reason.startswith(SEMANTIC_REVIEW_REASON_PREFIX)
+    ]
+    assert semantic_reasons != []
+    for reason in result.reasons:
+        assert fake_secret not in reason
+
+    event = store.list_events()[0]
+    for reason in event.reasons:
+        assert fake_secret not in reason
+    assert fake_secret not in (event.output_summary or "")
+    assert fake_secret not in event.arguments_summary
+
+
 def test_httpx_client_posts_openai_compatible_payload() -> None:
     requests: list[dict[str, object]] = []
 

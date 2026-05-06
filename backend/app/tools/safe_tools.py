@@ -488,7 +488,34 @@ class SafeToolService:
         except Exception:
             return risk_result
 
-        return self._conservative_review_result(risk_result, reviewed_result)
+        merged_result = self._conservative_review_result(risk_result, reviewed_result)
+        return self._mask_added_reasons(risk_result, merged_result)
+
+    def _mask_added_reasons(
+        self,
+        original_result: RiskResult,
+        merged_result: RiskResult,
+    ) -> RiskResult:
+        original_reasons = set(original_result.reasons)
+        masked_reasons: list[str] = []
+        changed = False
+        for reason in merged_result.reasons:
+            if reason in original_reasons:
+                masked_reasons.append(reason)
+                continue
+            masked_reason, _ = self._mask_text(reason)
+            if masked_reason != reason:
+                changed = True
+            masked_reasons.append(masked_reason)
+
+        if not changed:
+            return merged_result
+
+        return RiskResult(
+            risk_score=merged_result.risk_score,
+            decision=merged_result.decision,
+            reasons=masked_reasons,
+        )
 
     @staticmethod
     def _is_review_candidate(
