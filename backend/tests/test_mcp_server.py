@@ -239,6 +239,34 @@ def test_main_uses_injected_runner_without_blocking(
     assert len(ran_servers) == 1
 
 
+def test_mcp_server_with_real_safe_tool_service_masks_secrets_and_blocks_env(
+    tmp_path: Path,
+) -> None:
+    raw_secret = "sk-test123456"
+    safe_file = tmp_path / "public.txt"
+    safe_file.write_text(f"hello {raw_secret}", encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"OPENAI_API_KEY={raw_secret}\n", encoding="utf-8")
+
+    service = SafeToolService(workspace_root=tmp_path)
+    mcp = create_mcp_server(service)
+
+    safe_result = _call_tool(mcp, "sentry_read_file", {"path": "public.txt"})
+
+    assert safe_result["decision"] == "allow"
+    assert safe_result["ok"] is True
+    safe_output = safe_result["output"]
+    assert isinstance(safe_output, str)
+    assert "[API_KEY_001]" in safe_output
+    assert raw_secret not in json.dumps(safe_result)
+
+    env_result = _call_tool(mcp, "sentry_read_file", {"path": ".env"})
+
+    assert env_result["decision"] == "block"
+    assert env_result["ok"] is False
+    assert raw_secret not in json.dumps(env_result)
+
+
 def _call_tool(
     mcp: object,
     name: str,
