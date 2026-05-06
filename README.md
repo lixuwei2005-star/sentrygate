@@ -62,6 +62,7 @@ its own tools. Use the narrowest practical workspace root for the task.
 From the `backend` directory:
 
 ```powershell
+cd backend
 uv run pytest
 uv run ruff check .
 uv run mypy app
@@ -123,12 +124,16 @@ SentryGate MCP tools.
 Run the local demo from the `backend` directory:
 
 ```powershell
+cd backend
 uv run python scripts/demo_sentrygate.py
 ```
 
 The demo creates a temporary workspace, uses `SafeToolService` directly, and
 shows allow, block, and require-approval decisions without requiring Codex or a
 running MCP server.
+
+The demo uses SafeToolService directly and does not require Codex or a running
+MCP server.
 
 ## Security Limitations
 
