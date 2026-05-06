@@ -5,6 +5,12 @@ It demonstrates deterministic risk scoring, privacy masking, approval gating,
 hard blocking, and masked audit events for operations routed through its own MCP
 server.
 
+<p align="center">
+  <a href="README.zh-CN.md">
+    <img src="https://img.shields.io/badge/中文文档-README.zh--CN-blue" alt="中文文档">
+  </a>
+</p>
+
 ## Quick Demo
 
 Run the local demo from the `backend` directory:
