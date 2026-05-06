@@ -213,6 +213,106 @@ def test_repeated_read_file_behavior_requires_approval(tmp_path: Path) -> None:
     assert "many_recent_read_file_calls" in result.reasons
 
 
+def test_absolute_path_posix_commands_are_blocked(tmp_path: Path) -> None:
+    scorer = RiskScorer(tmp_path)
+
+    cases = {
+        "/usr/bin/sudo whoami": "sudo_command",
+        "/bin/rm -rf tmp": "dangerous_rm_recursive_force",
+        "/bin/chmod 777 file": "world_writable_chmod",
+        "/usr/bin/dd if=/dev/zero of=disk.img": "raw_disk_copy_command",
+        "/sbin/mkfs.ext4 /dev/sda": "filesystem_format_command",
+    }
+
+    for command, reason in cases.items():
+        result = scorer.score(
+            ToolCall(tool_name="run_command", arguments={"command": command})
+        )
+
+        assert result.decision == "block", command
+        assert result.risk_score == 100, command
+        assert reason in result.reasons, command
+
+
+def test_powershell_substring_false_positives_are_not_blocked(tmp_path: Path) -> None:
+    scorer = RiskScorer(tmp_path)
+
+    benign_commands = [
+        'echo "Start-Process is documented in start-process.md"',
+        'Get-Content notes-about-format-volume.txt',
+        'Write-Output "set-executionpolicy bypass cheatsheet"',
+    ]
+
+    for command in benign_commands:
+        result = scorer.score(
+            ToolCall(tool_name="run_command", arguments={"command": command})
+        )
+
+        assert result.decision == "require_approval", command
+        assert result.risk_score == 50, command
+        assert result.reasons == ["run_command_requires_approval"], command
+
+
+def test_powershell_remove_item_aliases_are_blocked(tmp_path: Path) -> None:
+    scorer = RiskScorer(tmp_path)
+
+    aliases = ["ri", "rmdir", "del", "erase", "Remove-Item"]
+
+    for alias in aliases:
+        command = f"{alias} -Recurse -Force C:\\temp\\target"
+        result = scorer.score(
+            ToolCall(tool_name="run_command", arguments={"command": command})
+        )
+
+        assert result.decision == "block", alias
+        assert result.risk_score == 100, alias
+        assert "dangerous_remove_item_recursive_force" in result.reasons, alias
+
+
+def test_powershell_remove_item_partial_flags_are_blocked(tmp_path: Path) -> None:
+    scorer = RiskScorer(tmp_path)
+
+    result = scorer.score(
+        ToolCall(
+            tool_name="run_command",
+            arguments={"command": "Remove-Item -rec -fo target"},
+        )
+    )
+
+    assert result.decision == "block"
+    assert "dangerous_remove_item_recursive_force" in result.reasons
+
+
+def test_sensitive_name_as_path_component_is_blocked(tmp_path: Path) -> None:
+    scorer = RiskScorer(tmp_path)
+
+    result = scorer.score(
+        ToolCall(
+            tool_name="read_file",
+            arguments={"path": "secret/.env/notes.txt"},
+        )
+    )
+
+    assert result.decision == "block"
+    assert result.risk_score == 100
+    assert result.reasons == ["sensitive_path"]
+
+
+def test_id_rsa_as_path_component_is_blocked(tmp_path: Path) -> None:
+    scorer = RiskScorer(tmp_path)
+
+    result = scorer.score(
+        ToolCall(
+            tool_name="read_file",
+            arguments={"path": "backups/id_rsa/old.pub"},
+        )
+    )
+
+    assert result.decision == "block"
+    assert result.risk_score == 100
+    assert result.reasons == ["sensitive_path"]
+
+
 class FakeClock:
     def __init__(self) -> None:
         self._now = 1_000.0

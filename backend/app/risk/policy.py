@@ -30,3 +30,9 @@ SENSITIVE_EXTENSIONS: Final[frozenset[str]] = frozenset({".pem", ".key", ".p12"}
 SENSITIVE_COMPONENT_PATHS: Final[tuple[tuple[str, ...], ...]] = (
     (".aws", "credentials"),
 )
+
+REMOVE_ITEM_ALIASES: Final[frozenset[str]] = frozenset(
+    {"remove-item", "ri", "rm", "rmdir", "del", "erase"}
+)
+POWERSHELL_RECURSE_FLAGS: Final[frozenset[str]] = frozenset({"-recurse", "-rec", "-r"})
+POWERSHELL_FORCE_FLAGS: Final[frozenset[str]] = frozenset({"-force", "-fo", "-f"})

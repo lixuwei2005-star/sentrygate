@@ -10,8 +10,11 @@ from app.risk.policy import (
     BEHAVIOR_WINDOW_SECONDS,
     HARD_BLOCK_SCORE,
     INVALID_ARGUMENT_SCORE,
+    POWERSHELL_FORCE_FLAGS,
+    POWERSHELL_RECURSE_FLAGS,
     READ_FILE_BEHAVIOR_SCORE_BUMP,
     READ_FILE_WINDOW_LIMIT,
+    REMOVE_ITEM_ALIASES,
     REQUIRE_APPROVAL_MAX_SCORE,
     RUN_COMMAND_BEHAVIOR_SCORE_BUMP,
     RUN_COMMAND_SCORE,
@@ -161,6 +164,8 @@ class RiskScorer:
             return True
         if suffix in SENSITIVE_EXTENSIONS:
             return True
+        if any(part in SENSITIVE_FILE_NAMES for part in relative_parts):
+            return True
         return any(
             self._contains_component_path(relative_parts, sensitive_path)
             for sensitive_path in SENSITIVE_COMPONENT_PATHS
@@ -202,17 +207,17 @@ class RiskScorer:
             return "download_pipe_to_shell"
 
         for index, token in enumerate(tokens):
-            lowered = token.lower()
-            if lowered == "sudo":
-                return "sudo_command"
-            if lowered.startswith("mkfs"):
-                return "filesystem_format_command"
-            if lowered == "rm" and self._has_recursive_force_flags(tokens[index + 1 :]):
-                return "dangerous_rm_recursive_force"
-            if lowered == "chmod" and "777" in tokens[index + 1 :]:
-                return "world_writable_chmod"
+            name = self._command_basename(token)
             following = tokens[index + 1 :]
-            if lowered == "dd" and any(
+            if name == "sudo":
+                return "sudo_command"
+            if name.startswith("mkfs"):
+                return "filesystem_format_command"
+            if name == "rm" and self._has_recursive_force_flags(following):
+                return "dangerous_rm_recursive_force"
+            if name == "chmod" and "777" in following:
+                return "world_writable_chmod"
+            if name == "dd" and any(
                 arg.lower().startswith("if=") for arg in following
             ):
                 return "raw_disk_copy_command"
@@ -220,23 +225,12 @@ class RiskScorer:
         return None
 
     def _detect_powershell_risk(self, command: str) -> str | None:
-        lowered_command = command.lower()
-
         if self._has_download_pipe_to_shell(
             command,
             {"invoke-webrequest", "iwr"},
             {"invoke-expression", "iex"},
         ):
             return "download_pipe_to_powershell_execution"
-        if "start-process" in lowered_command:
-            return "start_process_command"
-        if "format-volume" in lowered_command:
-            return "format_volume_command"
-        if (
-            "set-executionpolicy" in lowered_command
-            and "bypass" in lowered_command
-        ):
-            return "execution_policy_bypass"
 
         try:
             tokens = shlex.split(command, posix=False)
@@ -244,13 +238,35 @@ class RiskScorer:
             return None
 
         normalized_tokens = [token.lower() for token in tokens]
-        for index, token in enumerate(normalized_tokens):
-            if token == "remove-item":
-                following = normalized_tokens[index + 1 :]
-                if "-recurse" in following and "-force" in following:
-                    return "dangerous_remove_item_recursive_force"
+        for index, name in enumerate(normalized_tokens):
+            following = normalized_tokens[index + 1 :]
+            if name in REMOVE_ITEM_ALIASES and self._has_powershell_recurse_force(
+                following
+            ):
+                return "dangerous_remove_item_recursive_force"
+            if name == "start-process":
+                return "start_process_command"
+            if name == "format-volume":
+                return "format_volume_command"
+            if name == "set-executionpolicy" and "bypass" in following:
+                return "execution_policy_bypass"
 
         return None
+
+    @staticmethod
+    def _has_powershell_recurse_force(following: list[str]) -> bool:
+        following_set = set(following)
+        has_recurse = bool(POWERSHELL_RECURSE_FLAGS & following_set)
+        has_force = bool(POWERSHELL_FORCE_FLAGS & following_set)
+        return has_recurse and has_force
+
+    @staticmethod
+    def _command_basename(token: str) -> str:
+        lowered = token.lower()
+        for separator in ("/", "\\"):
+            if separator in lowered:
+                lowered = lowered.rsplit(separator, 1)[-1]
+        return lowered
 
     @staticmethod
     def _has_recursive_force_flags(tokens: list[str]) -> bool:
