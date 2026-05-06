@@ -2,16 +2,28 @@ import os
 import shlex
 import subprocess
 from pathlib import Path
+from typing import Protocol
 
 from app.audit.models import AuditEvent
 from app.audit.store import AuditStore, InMemoryAuditStore
 from app.privacy.masker import MaskingFinding, PrivacyMasker
 from app.risk.models import RiskResult, ToolCall
+from app.risk.policy import ALLOW_MAX_SCORE, REQUIRE_APPROVAL_MAX_SCORE
 from app.risk.scorer import RiskScorer
 from app.tools.models import ToolExecutionResult
 
 MAX_AUDIT_SUMMARY_CHARS = 2_000
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 5.0
+
+
+class RiskReviewProvider(Protocol):
+    def review_risk(
+        self,
+        tool_call: ToolCall,
+        original_result: RiskResult,
+        arguments_summary: str,
+    ) -> RiskResult:
+        ...
 
 
 class SafeToolService:
@@ -22,12 +34,14 @@ class SafeToolService:
         masker: PrivacyMasker | None = None,
         audit_store: AuditStore | None = None,
         command_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        risk_reviewer: RiskReviewProvider | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.risk_scorer = risk_scorer or RiskScorer(self.workspace_root)
         self.masker = masker or PrivacyMasker()
         self.audit_store = audit_store or InMemoryAuditStore()
         self.command_timeout_seconds = command_timeout_seconds
+        self.risk_reviewer = risk_reviewer or self._default_risk_reviewer()
 
     def sentry_read_file(
         self,
@@ -42,6 +56,11 @@ class SafeToolService:
         risk_result = self.risk_scorer.score_tool_call(tool_call)
         argument_summary, argument_findings = self._mask_text(
             f"path={self._safe_relative_display(path)}"
+        )
+        risk_result = self._review_risk_result(
+            tool_call,
+            risk_result,
+            argument_summary,
         )
 
         if risk_result.decision != "allow":
@@ -124,6 +143,11 @@ class SafeToolService:
             f"path={masked_path}; content_chars={len(content)}"
         )
         findings = self._merge_findings(path_findings, content_findings)
+        risk_result = self._review_risk_result(
+            tool_call,
+            risk_result,
+            argument_summary,
+        )
 
         if risk_result.decision != "allow":
             return self._denied_result(
@@ -189,6 +213,11 @@ class SafeToolService:
         risk_result = self.risk_scorer.score_tool_call(tool_call)
         argument_summary, argument_findings = self._mask_text(
             f"path={self._safe_relative_display(path)}"
+        )
+        risk_result = self._review_risk_result(
+            tool_call,
+            risk_result,
+            argument_summary,
         )
 
         if risk_result.decision != "allow":
@@ -258,6 +287,11 @@ class SafeToolService:
         risk_result = self.risk_scorer.score_tool_call(tool_call)
         argument_summary, argument_findings = self._mask_text(
             self._bounded_summary(f"command={command}")
+        )
+        risk_result = self._review_risk_result(
+            tool_call,
+            risk_result,
+            argument_summary,
         )
 
         if risk_result.decision != "allow":
@@ -434,6 +468,77 @@ class SafeToolService:
             )
         )
 
+    def _review_risk_result(
+        self,
+        tool_call: ToolCall,
+        risk_result: RiskResult,
+        arguments_summary: str,
+    ) -> RiskResult:
+        if self.risk_reviewer is None:
+            return risk_result
+        if not self._is_review_candidate(risk_result, arguments_summary):
+            return risk_result
+
+        try:
+            reviewed_result = self.risk_reviewer.review_risk(
+                tool_call,
+                risk_result,
+                arguments_summary,
+            )
+        except Exception:
+            return risk_result
+
+        return self._conservative_review_result(risk_result, reviewed_result)
+
+    @staticmethod
+    def _is_review_candidate(
+        risk_result: RiskResult,
+        arguments_summary: str,
+    ) -> bool:
+        return (
+            risk_result.decision == "require_approval"
+            and ALLOW_MAX_SCORE < risk_result.risk_score <= REQUIRE_APPROVAL_MAX_SCORE
+            and arguments_summary.strip() != ""
+        )
+
+    @staticmethod
+    def _conservative_review_result(
+        original_result: RiskResult,
+        reviewed_result: RiskResult,
+    ) -> RiskResult:
+        if original_result.decision in {"allow", "block"}:
+            return original_result
+        if reviewed_result == original_result:
+            return original_result
+
+        final_score = max(original_result.risk_score, reviewed_result.risk_score)
+        final_decision = original_result.decision
+        if (
+            reviewed_result.decision == "block"
+            or final_score > REQUIRE_APPROVAL_MAX_SCORE
+        ):
+            final_decision = "block"
+
+        reasons = list(original_result.reasons)
+        for reason in reviewed_result.reasons:
+            if reason not in reasons:
+                reasons.append(reason)
+
+        return RiskResult(
+            risk_score=final_score,
+            decision=final_decision,
+            reasons=reasons,
+        )
+
+    @staticmethod
+    def _default_risk_reviewer() -> RiskReviewProvider | None:
+        from app.risk.lmstudio_client import LMStudioRiskReviewer
+
+        reviewer = LMStudioRiskReviewer.from_env()
+        if not reviewer.enabled:
+            return None
+        return reviewer
+
     def _resolve_workspace_path(self, path: str) -> Path:
         input_path = Path(path)
         if input_path.is_absolute():
@@ -513,6 +618,7 @@ def configure_default_service(
     masker: PrivacyMasker | None = None,
     audit_store: AuditStore | None = None,
     command_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    risk_reviewer: RiskReviewProvider | None = None,
 ) -> None:
     global _default_service
     _default_service = SafeToolService(
@@ -521,6 +627,7 @@ def configure_default_service(
         masker=masker,
         audit_store=audit_store,
         command_timeout_seconds=command_timeout_seconds,
+        risk_reviewer=risk_reviewer,
     )
 
 
