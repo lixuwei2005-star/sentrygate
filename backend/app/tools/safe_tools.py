@@ -54,6 +54,16 @@ class SafeToolService:
 
         try:
             target_path = self._resolve_workspace_path(path)
+        except PermissionError as error:
+            return self._setup_error_result(
+                tool_call=tool_call,
+                risk_result=risk_result,
+                arguments_summary=argument_summary,
+                raw_error=f"path_outside_workspace: {error}",
+                findings=argument_findings,
+            )
+
+        try:
             content = target_path.read_text(encoding="utf-8")
         except UnicodeDecodeError as error:
             return self._execution_error_result(
@@ -125,6 +135,16 @@ class SafeToolService:
 
         try:
             target_path = self._resolve_workspace_path(path)
+        except PermissionError as error:
+            return self._setup_error_result(
+                tool_call=tool_call,
+                risk_result=risk_result,
+                arguments_summary=argument_summary,
+                raw_error=f"path_outside_workspace: {error}",
+                findings=findings,
+            )
+
+        try:
             target_path.write_text(content, encoding="utf-8")
         except OSError as error:
             return self._execution_error_result(
@@ -181,6 +201,16 @@ class SafeToolService:
 
         try:
             target_path = self._resolve_workspace_path(path)
+        except PermissionError as error:
+            return self._setup_error_result(
+                tool_call=tool_call,
+                risk_result=risk_result,
+                arguments_summary=argument_summary,
+                raw_error=f"path_outside_workspace: {error}",
+                findings=argument_findings,
+            )
+
+        try:
             entries = self._directory_listing(target_path)
         except OSError as error:
             return self._execution_error_result(
@@ -239,8 +269,19 @@ class SafeToolService:
             )
 
         try:
+            argv = self._command_argv(command)
+        except ValueError as error:
+            return self._setup_error_result(
+                tool_call=tool_call,
+                risk_result=risk_result,
+                arguments_summary=argument_summary,
+                raw_error=f"empty_command: {error}",
+                findings=argument_findings,
+            )
+
+        try:
             completed = subprocess.run(
-                self._command_argv(command),
+                argv,
                 cwd=self.workspace_root,
                 timeout=self.command_timeout_seconds,
                 capture_output=True,
@@ -248,7 +289,7 @@ class SafeToolService:
                 shell=False,
                 check=False,
             )
-        except (OSError, subprocess.SubprocessError, ValueError) as error:
+        except (OSError, subprocess.SubprocessError) as error:
             return self._execution_error_result(
                 tool_call=tool_call,
                 risk_result=risk_result,
@@ -300,6 +341,33 @@ class SafeToolService:
             risk_result=risk_result,
             arguments_summary=arguments_summary,
             output_summary=error,
+            findings=findings,
+            executed=False,
+        )
+        return ToolExecutionResult(
+            ok=False,
+            decision=risk_result.decision,
+            risk_score=risk_result.risk_score,
+            reasons=risk_result.reasons,
+            error=error,
+            masked_findings=findings,
+        )
+
+    def _setup_error_result(
+        self,
+        tool_call: ToolCall,
+        risk_result: RiskResult,
+        arguments_summary: str,
+        raw_error: str,
+        findings: tuple[MaskingFinding, ...],
+    ) -> ToolExecutionResult:
+        error, error_findings = self._mask_text(raw_error)
+        findings = self._merge_findings(findings, error_findings)
+        self._append_audit_event(
+            tool_call=tool_call,
+            risk_result=risk_result,
+            arguments_summary=arguments_summary,
+            output_summary=self._bounded_summary(error),
             findings=findings,
             executed=False,
         )
@@ -439,10 +507,34 @@ class SafeToolService:
 _default_service: SafeToolService | None = None
 
 
-def _get_default_service() -> SafeToolService:
+def configure_default_service(
+    workspace_root: str | Path,
+    risk_scorer: RiskScorer | None = None,
+    masker: PrivacyMasker | None = None,
+    audit_store: AuditStore | None = None,
+    command_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+) -> None:
     global _default_service
+    _default_service = SafeToolService(
+        workspace_root=workspace_root,
+        risk_scorer=risk_scorer,
+        masker=masker,
+        audit_store=audit_store,
+        command_timeout_seconds=command_timeout_seconds,
+    )
+
+
+def reset_default_service() -> None:
+    global _default_service
+    _default_service = None
+
+
+def _get_default_service() -> SafeToolService:
     if _default_service is None:
-        _default_service = SafeToolService(workspace_root=Path.cwd())
+        raise RuntimeError(
+            "SafeToolService is not configured. "
+            "Call configure_default_service() before using public wrappers."
+        )
     return _default_service
 
 

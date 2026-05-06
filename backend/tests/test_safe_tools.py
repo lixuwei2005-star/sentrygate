@@ -1,8 +1,26 @@
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from app.audit.store import InMemoryAuditStore
-from app.tools.safe_tools import SafeToolService
+from app.risk.models import RiskResult, ToolCall
+from app.risk.scorer import RiskScorer
+from app.tools.safe_tools import (
+    SafeToolService,
+    configure_default_service,
+    reset_default_service,
+    sentry_read_file,
+)
+
+
+class _PermissiveRiskScorer(RiskScorer):
+    def score_tool_call(self, tool_call: ToolCall) -> RiskResult:
+        return RiskResult(
+            risk_score=0,
+            decision="allow",
+            reasons=["test_permissive_scorer"],
+        )
 
 
 def test_blocked_read_file_env_does_not_read_and_audits(tmp_path: Path) -> None:
@@ -167,6 +185,92 @@ def test_audit_store_filters_by_session_and_limit() -> None:
         "a",
     ]
     assert [event.session_id for event in store.list_events(limit=2)] == ["b", "a"]
+
+
+def test_public_wrapper_raises_runtime_error_before_configure() -> None:
+    reset_default_service()
+    try:
+        with pytest.raises(RuntimeError):
+            sentry_read_file("README.md")
+    finally:
+        reset_default_service()
+
+
+def test_public_wrapper_works_after_configure_default_service(
+    tmp_path: Path,
+) -> None:
+    reset_default_service()
+    (tmp_path / "README.md").write_text("hello world", encoding="utf-8")
+    try:
+        configure_default_service(workspace_root=tmp_path)
+        result = sentry_read_file("README.md")
+        assert result.ok is True
+        assert result.decision == "allow"
+        assert result.output == "hello world"
+    finally:
+        reset_default_service()
+
+
+def test_reset_default_service_clears_configured_service(tmp_path: Path) -> None:
+    configure_default_service(workspace_root=tmp_path)
+    reset_default_service()
+    try:
+        with pytest.raises(RuntimeError):
+            sentry_read_file("README.md")
+    finally:
+        reset_default_service()
+
+
+def test_safe_tool_blocks_outside_workspace_even_with_permissive_scorer(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside-secret", encoding="utf-8")
+    store = InMemoryAuditStore()
+    service = SafeToolService(
+        workspace_root=workspace,
+        risk_scorer=_PermissiveRiskScorer(workspace),
+        audit_store=store,
+    )
+
+    result = service.sentry_read_file(str(outside))
+
+    assert result.ok is False
+    assert result.output is None
+    assert result.error is not None
+    assert "path_outside_workspace" in result.error
+    event = store.list_events()[0]
+    assert event.executed is False
+    assert event.tool_name == "read_file"
+    assert "outside-secret" not in event.model_dump_json()
+
+
+def test_run_command_empty_string_setup_error_marks_executed_false(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_run(
+        *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("subprocess.run should not execute on empty command")
+
+    monkeypatch.setattr("app.tools.safe_tools.subprocess.run", fail_run)
+    store = InMemoryAuditStore()
+    service = SafeToolService(
+        workspace_root=tmp_path,
+        risk_scorer=_PermissiveRiskScorer(tmp_path),
+        audit_store=store,
+    )
+
+    result = service.sentry_run_command("   ")
+
+    assert result.ok is False
+    assert result.error is not None
+    assert "empty_command" in result.error
+    event = store.list_events()[0]
+    assert event.executed is False
 
 
 def test_audit_events_mask_command_arguments(tmp_path: Path) -> None:
