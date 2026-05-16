@@ -177,6 +177,19 @@ Adapt this shape to your local Codex MCP configuration mechanism. SentryGate
 protection applies only when the agent routes protected operations through the
 SentryGate MCP tools.
 
+### Automatic Codex MCP Setup
+
+To configure Codex Desktop or Codex CLI automatically, run this from the
+repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup_codex_mcp.ps1 -WorkspaceRoot "C:\Users\LIXUWEI\Desktop\sentrygate-workspace"
+```
+
+The script edits `~/.codex/config.toml`, backs up an existing config before
+writing, and configures SentryGate with an explicit workspace root and JSONL
+audit log path. Restart Codex Desktop after running it.
+
 ## AgentOps Dashboard
 
 SentryGate ships with a local read-only Streamlit dashboard that visualizes

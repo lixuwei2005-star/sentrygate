@@ -192,6 +192,18 @@ SentryGate MCP Server。workspace path 应使用绝对路径，并通过
 请根据你本地的 Codex MCP 配置方式调整这段配置。SentryGate 的保护只在 Agent
 把受保护操作路由到 SentryGate MCP tools 时生效。
 
+### 自动配置 Codex MCP
+
+如果要自动配置 Codex Desktop 或 Codex CLI，请在仓库根目录运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup_codex_mcp.ps1 -WorkspaceRoot "C:\Users\LIXUWEI\Desktop\sentrygate-workspace"
+```
+
+这个脚本会编辑 `~/.codex/config.toml`，在写入前备份已有配置，并使用显式的
+workspace root 和 JSONL 审计日志路径配置 SentryGate。运行后请重启 Codex
+Desktop。
+
 ## AgentOps Dashboard
 
 SentryGate 自带一个本地只读的 Streamlit dashboard，用于可视化 SentryGate
