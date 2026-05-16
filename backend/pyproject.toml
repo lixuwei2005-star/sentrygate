@@ -31,7 +31,7 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.mypy]
 python_version = "3.11"
-files = ["app"]
+files = ["app", "dashboard"]
 disallow_untyped_defs = true
 warn_redundant_casts = true
 warn_unused_ignores = true

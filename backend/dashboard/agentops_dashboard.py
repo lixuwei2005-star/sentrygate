@@ -51,7 +51,7 @@ def _render_status_strip(result: LoadResult) -> None:
     cols = st.columns(3)
     cols[0].markdown(f"**Log path**: `{result.path}`")
     cols[1].markdown(f"**Events loaded**: {len(result.events)}")
-    if result.path.exists():
+    if not result.rejected and result.path.exists():
         mtime = datetime.fromtimestamp(
             result.path.stat().st_mtime, tz=UTC
         )
@@ -177,7 +177,7 @@ def _render_event_detail(result: LoadResult) -> None:
         st.caption("(none)")
 
     st.markdown(
-        "**masked_findings** (mask placeholders only — never raw secrets)"
+        "**masked_findings** (mask placeholders only - never raw secrets)"
     )
     if event.masked_findings:
         findings_rows = [
@@ -209,6 +209,9 @@ def render() -> None:
 
     _render_status_strip(result)
 
+    if result.warning is not None:
+        st.warning(result.warning)
+
     if result.missing:
         st.warning(
             f"Audit log not found at `{result.path}`. "
@@ -216,7 +219,7 @@ def render() -> None:
             "`--audit-log-path backend/.sentrygate/audit_events.jsonl` "
             "and call some tools to generate events."
         )
-    elif result.empty:
+    elif result.empty and not result.rejected:
         st.info("No audit events yet.")
 
     if result.skipped > 0:

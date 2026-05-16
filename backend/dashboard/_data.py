@@ -8,9 +8,12 @@ from app.audit.jsonl_store import JsonlAuditStore
 from app.audit.models import AuditEvent
 
 _DEFAULT_LOAD_LIMIT = 100_000
+REJECTED_AUDIT_LOG_PATH_MESSAGE = (
+    "Rejected path: dashboard only reads SentryGate JSONL audit logs."
+)
 
 RECENT_EVENT_COLUMNS: tuple[str, ...] = (
-    "started_at",
+    "timestamp",
     "trace_id",
     "span_id",
     "session_id",
@@ -39,6 +42,14 @@ class LoadResult:
     missing: bool
     empty: bool
     skipped: int
+    rejected: bool = False
+    warning: str | None = None
+
+
+@dataclass(frozen=True)
+class PathValidationResult:
+    accepted: bool
+    warning: str | None = None
 
 
 def resolve_audit_log_path(raw: str) -> Path:
@@ -49,30 +60,70 @@ def resolve_audit_log_path(raw: str) -> Path:
     return (repo_root / path).resolve()
 
 
+def validate_audit_log_path(path: Path) -> PathValidationResult:
+    if path.suffix.lower() != ".jsonl":
+        return PathValidationResult(
+            accepted=False,
+            warning=REJECTED_AUDIT_LOG_PATH_MESSAGE,
+        )
+
+    try:
+        if path.exists() and path.is_dir():
+            return PathValidationResult(
+                accepted=False,
+                warning=REJECTED_AUDIT_LOG_PATH_MESSAGE,
+            )
+    except OSError:
+        return PathValidationResult(
+            accepted=False,
+            warning=REJECTED_AUDIT_LOG_PATH_MESSAGE,
+        )
+
+    if not any(part.lower() == ".sentrygate" for part in path.parts):
+        return PathValidationResult(
+            accepted=False,
+            warning=REJECTED_AUDIT_LOG_PATH_MESSAGE,
+        )
+
+    return PathValidationResult(accepted=True)
+
+
 def load_events(path: Path, limit: int = _DEFAULT_LOAD_LIMIT) -> LoadResult:
+    validation = validate_audit_log_path(path)
+    if not validation.accepted:
+        return LoadResult(
+            events=[],
+            path=path,
+            missing=False,
+            empty=True,
+            skipped=0,
+            rejected=True,
+            warning=validation.warning,
+        )
+
     if not path.exists():
         return LoadResult(
-            events=[], path=path, missing=True, empty=True, skipped=0
+            events=[],
+            path=path,
+            missing=True,
+            empty=True,
+            skipped=0,
+            warning=validation.warning,
         )
 
-    non_empty_lines = 0
+    valid_events: list[AuditEvent] = []
+    skipped = 0
     with path.open(encoding="utf-8") as audit_file:
         for line in audit_file:
-            if line.strip() != "":
-                non_empty_lines += 1
+            if line.strip() == "":
+                continue
+            event = JsonlAuditStore._event_from_line(line)
+            if event is None:
+                skipped += 1
+                continue
+            valid_events.append(event)
 
-    if non_empty_lines == 0:
-        return LoadResult(
-            events=[], path=path, missing=False, empty=True, skipped=0
-        )
-
-    events = JsonlAuditStore(path).list_events(limit=limit)
-
-    if non_empty_lines > limit:
-        # Truncation, not parse failure — don't misreport as skipped.
-        skipped = 0
-    else:
-        skipped = max(0, non_empty_lines - len(events))
+    events = valid_events[-limit:] if limit > 0 else []
 
     return LoadResult(
         events=events,
@@ -80,6 +131,7 @@ def load_events(path: Path, limit: int = _DEFAULT_LOAD_LIMIT) -> LoadResult:
         missing=False,
         empty=len(events) == 0,
         skipped=skipped,
+        warning=validation.warning,
     )
 
 
@@ -97,7 +149,7 @@ def build_recent_events_dataframe(
     sorted_events = sort_events_newest_first(events)[:limit]
     rows = [
         {
-            "started_at": event.started_at or event.timestamp,
+            "timestamp": event.started_at or event.timestamp,
             "trace_id": event.trace_id or "",
             "span_id": event.span_id or "",
             "session_id": event.session_id or "",

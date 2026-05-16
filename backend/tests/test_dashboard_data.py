@@ -7,6 +7,7 @@ from app.privacy.masker import MaskingFinding
 from app.privacy.patterns import SecretKind
 from dashboard._data import (
     RECENT_EVENT_COLUMNS,
+    REJECTED_AUDIT_LOG_PATH_MESSAGE,
     build_latency_series,
     build_recent_events_dataframe,
     build_risk_score_buckets,
@@ -16,6 +17,45 @@ from dashboard._data import (
     resolve_audit_log_path,
     sort_events_newest_first,
 )
+
+
+def test_load_events_rejects_non_jsonl_path_without_opening(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = tmp_path / ".sentrygate" / "audit_events.txt"
+    log_path.parent.mkdir()
+    log_path.write_text("not audit jsonl", encoding="utf-8")
+
+    def fail_open(*args: object, **kwargs: object) -> object:
+        raise AssertionError("rejected path should not be opened")
+
+    monkeypatch.setattr(Path, "open", fail_open)
+
+    result = load_events(log_path)
+
+    assert result.rejected is True
+    assert result.events == []
+    assert result.warning == REJECTED_AUDIT_LOG_PATH_MESSAGE
+
+
+def test_load_events_rejects_directory_path_without_opening(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    log_path = tmp_path / ".sentrygate" / "audit_events.jsonl"
+    log_path.mkdir(parents=True)
+
+    def fail_open(*args: object, **kwargs: object) -> object:
+        raise AssertionError("rejected directory should not be opened")
+
+    monkeypatch.setattr(Path, "open", fail_open)
+
+    result = load_events(log_path)
+
+    assert result.rejected is True
+    assert result.events == []
+    assert result.warning == REJECTED_AUDIT_LOG_PATH_MESSAGE
 
 
 def test_resolve_audit_log_path_anchors_relative_paths_to_repo_root() -> None:
@@ -38,7 +78,7 @@ def test_resolve_audit_log_path_returns_absolute_path_unchanged(
 
 
 def test_load_events_reports_missing_file(tmp_path: Path) -> None:
-    missing = tmp_path / "absent.jsonl"
+    missing = _audit_log_path(tmp_path)
 
     result = load_events(missing)
 
@@ -50,7 +90,7 @@ def test_load_events_reports_missing_file(tmp_path: Path) -> None:
 
 
 def test_load_events_reports_empty_file(tmp_path: Path) -> None:
-    empty_path = tmp_path / "empty.jsonl"
+    empty_path = _audit_log_path(tmp_path)
     empty_path.write_text("", encoding="utf-8")
 
     result = load_events(empty_path)
@@ -64,7 +104,7 @@ def test_load_events_reports_empty_file(tmp_path: Path) -> None:
 def test_load_events_returns_events_and_counts_skipped_lines(
     tmp_path: Path,
 ) -> None:
-    log_path = tmp_path / "audit.jsonl"
+    log_path = _audit_log_path(tmp_path)
     valid = _event(tool_name="read_file", decision="allow", risk_score=10)
     log_path.write_text(
         "\n".join(
@@ -85,6 +125,55 @@ def test_load_events_returns_events_and_counts_skipped_lines(
     assert result.skipped == 2
 
 
+def test_load_events_loads_valid_default_style_sentrygate_path(
+    tmp_path: Path,
+) -> None:
+    log_path = _audit_log_path(tmp_path)
+    valid = _event(tool_name="read_file", decision="allow", risk_score=10)
+    log_path.write_text(
+        json.dumps(valid.model_dump(mode="json")),
+        encoding="utf-8",
+    )
+
+    result = load_events(log_path)
+
+    assert result.rejected is False
+    assert result.missing is False
+    assert result.empty is False
+    assert result.warning is None
+    assert [event.event_id for event in result.events] == [valid.event_id]
+
+
+def test_load_events_counts_malformed_lines_independent_of_limit(
+    tmp_path: Path,
+) -> None:
+    log_path = _audit_log_path(tmp_path)
+    valid_events = [
+        _event(tool_name=f"tool_{index}", decision="allow", risk_score=10)
+        for index in range(3)
+    ]
+    log_path.write_text(
+        "\n".join(
+            [
+                json.dumps(valid_events[0].model_dump(mode="json")),
+                "{not-json",
+                json.dumps(valid_events[1].model_dump(mode="json")),
+                json.dumps({"event_id": "invalid-shape"}),
+                json.dumps(valid_events[2].model_dump(mode="json")),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = load_events(log_path, limit=2)
+
+    assert result.skipped == 2
+    assert [event.event_id for event in result.events] == [
+        valid_events[1].event_id,
+        valid_events[2].event_id,
+    ]
+
+
 def test_build_recent_events_dataframe_sorts_newest_first_and_caps_limit() -> (
     None
 ):
@@ -103,9 +192,12 @@ def test_build_recent_events_dataframe_sorts_newest_first_and_caps_limit() -> (
     frame = build_recent_events_dataframe(events, limit=2)
 
     assert list(frame.columns) == list(RECENT_EVENT_COLUMNS)
+    assert "timestamp" in frame.columns
+    assert "started_at" not in frame.columns
     assert len(frame) == 2
     assert frame.iloc[0]["tool_name"] == "tool_2"
     assert frame.iloc[1]["tool_name"] == "tool_1"
+    assert frame.iloc[0]["timestamp"] == base + timedelta(seconds=2)
     assert frame.iloc[0]["reasons"] == "reason_2, shared"
     assert frame.iloc[0]["masked_findings"] == 0
 
@@ -290,3 +382,12 @@ def _event(
     if timestamp is not None:
         kwargs["timestamp"] = timestamp
     return AuditEvent(**kwargs)  # type: ignore[arg-type]
+
+
+def _audit_log_path(
+    tmp_path: Path,
+    name: str = "audit_events.jsonl",
+) -> Path:
+    log_path = tmp_path / ".sentrygate" / name
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    return log_path
