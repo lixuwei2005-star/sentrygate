@@ -86,26 +86,49 @@ def create_mcp_server(service: SafeToolService) -> FastMCP:
     mcp = FastMCP("SentryGate")
 
     @mcp.tool(structured_output=True)
-    def sentry_read_file(path: str) -> dict[str, object]:
+    def sentry_read_file(
+        path: str,
+        session_id: str | None = None,
+    ) -> dict[str, object]:
         """Read a file through SentryGate policy, masking, and audit controls."""
-        return serialize_result(service.sentry_read_file(path=path))
-
-    @mcp.tool(structured_output=True)
-    def sentry_write_file(path: str, content: str) -> dict[str, object]:
-        """Write a file through SentryGate policy, masking, and audit controls."""
         return serialize_result(
-            service.sentry_write_file(path=path, content=content)
+            service.sentry_read_file(path=path, session_id=session_id)
         )
 
     @mcp.tool(structured_output=True)
-    def sentry_list_directory(path: str) -> dict[str, object]:
-        """List a directory through SentryGate policy, masking, and audit controls."""
-        return serialize_result(service.sentry_list_directory(path=path))
+    def sentry_write_file(
+        path: str,
+        content: str,
+        session_id: str | None = None,
+    ) -> dict[str, object]:
+        """Write a file through SentryGate policy, masking, and audit controls."""
+        return serialize_result(
+            service.sentry_write_file(
+                path=path,
+                content=content,
+                session_id=session_id,
+            )
+        )
 
     @mcp.tool(structured_output=True)
-    def sentry_run_command(command: str) -> dict[str, object]:
+    def sentry_list_directory(
+        path: str,
+        session_id: str | None = None,
+    ) -> dict[str, object]:
+        """List a directory through SentryGate policy, masking, and audit controls."""
+        return serialize_result(
+            service.sentry_list_directory(path=path, session_id=session_id)
+        )
+
+    @mcp.tool(structured_output=True)
+    def sentry_run_command(
+        command: str,
+        session_id: str | None = None,
+    ) -> dict[str, object]:
         """Run a command through SentryGate policy, masking, and audit controls."""
-        return serialize_result(service.sentry_run_command(command=command))
+        return serialize_result(
+            service.sentry_run_command(command=command, session_id=session_id)
+        )
 
     return mcp
 

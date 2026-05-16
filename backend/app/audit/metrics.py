@@ -57,6 +57,9 @@ def summarize_audit_events(
         average_latency_ms=(
             sum(latencies) / len(latencies) if latencies else 0.0
         ),
+        # high_risk_events counts events with risk_score > REQUIRE_APPROVAL_MAX_SCORE,
+        # i.e. block-tier events (75-100) in the 0-39 allow / 40-74 require_approval /
+        # 75-100 block model.
         high_risk_events=sum(
             1
             for event in event_list

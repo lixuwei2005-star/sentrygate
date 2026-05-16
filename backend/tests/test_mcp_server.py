@@ -28,10 +28,16 @@ from app.tools.safe_tools import SafeToolService
 
 class FakeSafeToolService:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, str]]] = []
+        self.calls: list[tuple[str, dict[str, object]]] = []
 
-    def sentry_read_file(self, path: str) -> ToolExecutionResult:
-        self.calls.append(("sentry_read_file", {"path": path}))
+    def sentry_read_file(
+        self,
+        path: str,
+        session_id: str | None = None,
+    ) -> ToolExecutionResult:
+        self.calls.append(
+            ("sentry_read_file", {"path": path, "session_id": session_id})
+        )
         return ToolExecutionResult(
             ok=True,
             decision="allow",
@@ -40,9 +46,17 @@ class FakeSafeToolService:
             output=f"read:{path}",
         )
 
-    def sentry_write_file(self, path: str, content: str) -> ToolExecutionResult:
+    def sentry_write_file(
+        self,
+        path: str,
+        content: str,
+        session_id: str | None = None,
+    ) -> ToolExecutionResult:
         self.calls.append(
-            ("sentry_write_file", {"path": path, "content": content})
+            (
+                "sentry_write_file",
+                {"path": path, "content": content, "session_id": session_id},
+            )
         )
         return ToolExecutionResult(
             ok=False,
@@ -52,8 +66,14 @@ class FakeSafeToolService:
             error="operation_requires_approval",
         )
 
-    def sentry_list_directory(self, path: str) -> ToolExecutionResult:
-        self.calls.append(("sentry_list_directory", {"path": path}))
+    def sentry_list_directory(
+        self,
+        path: str,
+        session_id: str | None = None,
+    ) -> ToolExecutionResult:
+        self.calls.append(
+            ("sentry_list_directory", {"path": path, "session_id": session_id})
+        )
         return ToolExecutionResult(
             ok=True,
             decision="allow",
@@ -62,8 +82,17 @@ class FakeSafeToolService:
             output=f"[file] {path}",
         )
 
-    def sentry_run_command(self, command: str) -> ToolExecutionResult:
-        self.calls.append(("sentry_run_command", {"command": command}))
+    def sentry_run_command(
+        self,
+        command: str,
+        session_id: str | None = None,
+    ) -> ToolExecutionResult:
+        self.calls.append(
+            (
+                "sentry_run_command",
+                {"command": command, "session_id": session_id},
+            )
+        )
         return ToolExecutionResult(
             ok=False,
             decision="require_approval",
@@ -236,15 +265,97 @@ def test_mcp_tools_delegate_to_safe_tool_service() -> None:
     )
 
     assert fake_service.calls == [
-        ("sentry_read_file", {"path": "README.md"}),
-        ("sentry_write_file", {"path": "notes.txt", "content": "hello"}),
-        ("sentry_list_directory", {"path": "."}),
-        ("sentry_run_command", {"command": "pytest --version"}),
+        ("sentry_read_file", {"path": "README.md", "session_id": None}),
+        (
+            "sentry_write_file",
+            {"path": "notes.txt", "content": "hello", "session_id": None},
+        ),
+        ("sentry_list_directory", {"path": ".", "session_id": None}),
+        (
+            "sentry_run_command",
+            {"command": "pytest --version", "session_id": None},
+        ),
     ]
     assert read_result["output"] == "read:README.md"
     assert write_result["decision"] == "require_approval"
     assert list_result["output"] == "[file] ."
     assert command_result["error"] == "operation_requires_approval"
+
+
+def test_mcp_sentry_read_file_forwards_session_id() -> None:
+    fake_service = FakeSafeToolService()
+    mcp = create_mcp_server(cast(SafeToolService, fake_service))
+
+    _call_tool(
+        mcp,
+        "sentry_read_file",
+        {"path": "README.md", "session_id": "session-1"},
+    )
+
+    assert fake_service.calls == [
+        (
+            "sentry_read_file",
+            {"path": "README.md", "session_id": "session-1"},
+        ),
+    ]
+
+
+def test_mcp_sentry_write_file_forwards_session_id() -> None:
+    fake_service = FakeSafeToolService()
+    mcp = create_mcp_server(cast(SafeToolService, fake_service))
+
+    _call_tool(
+        mcp,
+        "sentry_write_file",
+        {"path": "notes.txt", "content": "hello", "session_id": "session-2"},
+    )
+
+    assert fake_service.calls == [
+        (
+            "sentry_write_file",
+            {
+                "path": "notes.txt",
+                "content": "hello",
+                "session_id": "session-2",
+            },
+        ),
+    ]
+
+
+def test_mcp_sentry_list_directory_forwards_session_id() -> None:
+    fake_service = FakeSafeToolService()
+    mcp = create_mcp_server(cast(SafeToolService, fake_service))
+
+    _call_tool(
+        mcp,
+        "sentry_list_directory",
+        {"path": ".", "session_id": "session-3"},
+    )
+
+    assert fake_service.calls == [
+        (
+            "sentry_list_directory",
+            {"path": ".", "session_id": "session-3"},
+        ),
+    ]
+
+
+def test_mcp_sentry_run_command_forwards_session_id() -> None:
+    fake_service = FakeSafeToolService()
+    mcp = create_mcp_server(cast(SafeToolService, fake_service))
+
+    _call_tool(
+        mcp,
+        "sentry_run_command",
+        {"command": "pytest --version", "session_id": "session-4"},
+    )
+
+    assert fake_service.calls == [
+        (
+            "sentry_run_command",
+            {"command": "pytest --version", "session_id": "session-4"},
+        ),
+    ]
 
 
 def test_main_missing_workspace_writes_error_to_stderr(

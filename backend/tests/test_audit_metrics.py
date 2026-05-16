@@ -63,6 +63,38 @@ def test_summarize_audit_events_counts_core_metrics() -> None:
     ]
 
 
+def test_summarize_audit_events_default_top_risk_reason_limit_is_five() -> None:
+    def make(reasons: list[str]) -> AuditEvent:
+        return _event(
+            tool_name="read_file",
+            decision="allow",
+            risk_score=10,
+            reasons=reasons,
+            executed=True,
+        )
+
+    events: list[AuditEvent] = []
+    events.extend(make(["reason_a"]) for _ in range(6))
+    events.extend(make(["reason_b"]) for _ in range(5))
+    events.extend(make(["reason_c"]) for _ in range(4))
+    events.extend(make(["reason_d"]) for _ in range(3))
+    events.extend(make(["reason_e"]) for _ in range(2))
+    events.append(make(["reason_f"]))
+    events.append(make(["reason_g"]))
+
+    summary = summarize_audit_events(events)
+
+    assert [
+        reason_count.model_dump() for reason_count in summary.top_risk_reasons
+    ] == [
+        {"reason": "reason_a", "count": 6},
+        {"reason": "reason_b", "count": 5},
+        {"reason": "reason_c", "count": 4},
+        {"reason": "reason_d", "count": 3},
+        {"reason": "reason_e", "count": 2},
+    ]
+
+
 def test_summarize_audit_events_empty_input_uses_stable_defaults() -> None:
     summary = summarize_audit_events([])
 
