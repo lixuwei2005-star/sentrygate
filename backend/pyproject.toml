@@ -16,6 +16,7 @@ dev = [
     "mypy",
     "pytest",
     "ruff",
+    "streamlit",
 ]
 
 [tool.pytest.ini_options]
@@ -36,3 +37,7 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 warn_return_any = true
 no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = ["pandas", "pandas.*"]
+ignore_missing_imports = true
