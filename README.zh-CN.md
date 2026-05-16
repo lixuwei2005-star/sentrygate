@@ -192,6 +192,79 @@ SentryGate MCP Server。workspace path 应使用绝对路径，并通过
 请根据你本地的 Codex MCP 配置方式调整这段配置。SentryGate 的保护只在 Agent
 把受保护操作路由到 SentryGate MCP tools 时生效。
 
+## AgentOps Dashboard
+
+SentryGate 自带一个本地只读的 Streamlit dashboard，用于可视化 SentryGate
+JSONL 审计日志。它是一个本地原型，用来查看由 MCP 路由的工具调用产生的脱敏审计
+事件。它不是生产级监控，也不是完整沙箱。
+
+### 1. 启动 MCP Server 并开启持久化 JSONL 审计日志
+
+传入绝对的 workspace root 和审计日志路径，让 SentryGate 把脱敏审计事件写入
+`.sentrygate/` 目录下的 JSONL 文件：
+
+```powershell
+cd backend
+uv run python -m app.mcp.server --workspace-root C:/Users/LIXUWEI/Desktop/sentrygate-workspace --audit-log-path .sentrygate/audit_events.jsonl
+```
+
+审计日志路径相对于 `backend` 目录解析。每一次被处理的 MCP 工具调用都会向该
+文件追加一行 JSON。
+
+### 2. 通过 Codex 触发 MCP 调用
+
+SentryGate MCP Server 启动后，让 Codex（或其他 MCP 兼容的 Agent）调用
+SentryGate MCP tools，让审计事件不断累积。例如：
+
+- `sentry_list_directory(".")`
+- `sentry_read_file("README.md")`
+- `sentry_read_file(".env")`
+- `sentry_write_file("test.txt", "hello")`
+- `sentry_run_command("rm -rf tmp")`
+
+这些调用会覆盖 allow、block 和 `require_approval` 路径，并触发隐私脱敏和风险
+评分。只有经过 MCP 路由的工具调用才会出现在审计日志中。
+
+### 3. 启动 Dashboard
+
+在另一个终端，从 `backend` 目录运行：
+
+```powershell
+cd backend
+uv run streamlit run dashboard/agentops_dashboard.py
+```
+
+Streamlit 会在本地浏览器中打开 dashboard。默认读取
+`backend/.sentrygate/audit_events.jsonl`。你可以在侧边栏中修改路径。
+
+### Dashboard 展示的内容
+
+- 总工具调用数。
+- allow / block / require_approval 各自的计数。
+- 已执行调用数。
+- 平均延迟。
+- 高风险事件数。
+- 脱敏命中数（masked findings）。
+- 各个 SentryGate 工具的调用次数。
+- 决策分布。
+- 风险评分分布。
+- 主要风险原因（top risk reasons）。
+- 最近事件列表。
+- 事件详情视图，包含 `trace_id`、`span_id`、`latency_ms`、
+  `arguments_summary` 和 `output_summary`。
+
+### 安全边界
+
+- Dashboard 是只读的。
+- 它只读取 `.sentrygate/*.jsonl` 路径下的 SentryGate JSONL 审计日志。
+- 它不会直接读取受保护的 workspace。
+- 它不会执行命令。
+- 它不会调用 MCP tools。
+- 它不会暴露原始 secret，因为 SentryGate 的审计事件只保存脱敏后的摘要。
+
+这是一个本地原型，只可视化经过 MCP 路由的工具调用。它不是生产级监控，也不是
+完整沙箱。
+
 ## 本地 Demo
 
 本地 demo 的入口是：

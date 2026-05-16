@@ -177,6 +177,82 @@ Adapt this shape to your local Codex MCP configuration mechanism. SentryGate
 protection applies only when the agent routes protected operations through the
 SentryGate MCP tools.
 
+## AgentOps Dashboard
+
+SentryGate ships with a local read-only Streamlit dashboard that visualizes
+SentryGate JSONL audit logs. It is a local prototype for inspecting masked
+audit events produced by MCP-routed tool calls. It is not production-grade
+monitoring and it is not a full sandbox.
+
+### 1. Start the MCP server with persistent JSONL audit logging
+
+Pass an absolute workspace root and an audit log path so SentryGate writes
+masked audit events to a JSONL file under `.sentrygate/`:
+
+```powershell
+cd backend
+uv run python -m app.mcp.server --workspace-root C:/Users/LIXUWEI/Desktop/sentrygate-workspace --audit-log-path .sentrygate/audit_events.jsonl
+```
+
+The audit log path is resolved relative to the `backend` directory. Each
+processed MCP tool call appends one JSON object per line to this file.
+
+### 2. Drive the MCP server from Codex
+
+Once the SentryGate MCP server is running, make Codex (or another MCP-compatible
+agent) call SentryGate MCP tools so audit events accumulate. For example:
+
+- `sentry_list_directory(".")`
+- `sentry_read_file("README.md")`
+- `sentry_read_file(".env")`
+- `sentry_write_file("test.txt", "hello")`
+- `sentry_run_command("rm -rf tmp")`
+
+These exercise allow, block, and `require_approval` paths, plus privacy masking
+and risk scoring. Only MCP-routed tool calls appear in the audit log.
+
+### 3. Start the dashboard
+
+In a separate terminal, from the `backend` directory:
+
+```powershell
+cd backend
+uv run streamlit run dashboard/agentops_dashboard.py
+```
+
+Streamlit will open the dashboard in your local browser. By default it reads
+`backend/.sentrygate/audit_events.jsonl`. You can change the path in the
+sidebar.
+
+### What the dashboard shows
+
+- Total tool calls.
+- Allow, block, and `require_approval` counts.
+- Executed calls.
+- Average latency.
+- High-risk events.
+- Masked finding count.
+- Tool call counts per SentryGate tool.
+- Decision distribution.
+- Risk score distribution.
+- Top risk reasons.
+- Recent events table.
+- Event detail view with `trace_id`, `span_id`, `latency_ms`,
+  `arguments_summary`, and `output_summary`.
+
+### Safety boundary
+
+- The dashboard is read-only.
+- It only reads SentryGate JSONL audit logs under `.sentrygate/*.jsonl`.
+- It does not read the protected workspace directly.
+- It does not execute commands.
+- It does not call MCP tools.
+- It does not reveal raw secrets, because SentryGate audit events store masked
+  summaries.
+
+This is a local prototype that visualizes MCP-routed tool calls only. It is not
+production-grade monitoring and it is not a full sandbox.
+
 ## Roadmap
 
 Possible future work:
