@@ -5,14 +5,18 @@ from typing import cast
 
 import pytest
 
+from app.audit.jsonl_store import JsonlAuditStore
+from app.audit.store import InMemoryAuditStore
 from app.mcp import server
 from app.mcp.server import (
+    AUDIT_LOG_PATH_ENV,
     MISSING_WORKSPACE_ROOT_ERROR,
     WORKSPACE_ROOT_ENV,
     WorkspaceRootError,
     create_mcp_server,
     create_service,
     main,
+    resolve_audit_log_path,
     resolve_workspace_root,
     serialize_result,
 )
@@ -124,10 +128,51 @@ def test_resolve_workspace_root_rejects_file(tmp_path: Path) -> None:
         resolve_workspace_root(str(file_root))
 
 
+def test_resolve_audit_log_path_uses_cli_before_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli_path = tmp_path / "cli" / "audit.jsonl"
+    env_path = tmp_path / "env" / "audit.jsonl"
+    monkeypatch.setenv(AUDIT_LOG_PATH_ENV, str(env_path))
+
+    assert resolve_audit_log_path(str(cli_path)) == cli_path.resolve()
+
+
+def test_resolve_audit_log_path_uses_env_when_cli_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv(AUDIT_LOG_PATH_ENV, str(env_path))
+
+    assert resolve_audit_log_path(None) == env_path.resolve()
+
+
+def test_resolve_audit_log_path_treats_blank_values_as_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(AUDIT_LOG_PATH_ENV, "   ")
+
+    assert resolve_audit_log_path(" ") is None
+
+
 def test_create_service_passes_explicit_workspace_root(tmp_path: Path) -> None:
     service = create_service(tmp_path)
 
     assert service.workspace_root == tmp_path.resolve()
+    assert isinstance(service.audit_store, InMemoryAuditStore)
+
+
+def test_create_service_uses_jsonl_audit_store_when_path_is_supplied(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "audit.jsonl"
+
+    service = create_service(tmp_path, audit_log_path=log_path)
+
+    assert isinstance(service.audit_store, JsonlAuditStore)
+    assert service.audit_store.path == log_path
 
 
 def test_serialize_result_returns_safe_json_compatible_data() -> None:

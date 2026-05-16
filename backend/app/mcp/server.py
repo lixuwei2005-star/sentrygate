@@ -7,10 +7,12 @@ from typing import cast
 
 from mcp.server.fastmcp import FastMCP
 
+from app.audit.jsonl_store import JsonlAuditStore
 from app.tools.models import ToolExecutionResult
 from app.tools.safe_tools import SafeToolService
 
 WORKSPACE_ROOT_ENV = "SENTRYGATE_WORKSPACE_ROOT"
+AUDIT_LOG_PATH_ENV = "SENTRYGATE_AUDIT_LOG_PATH"
 MISSING_WORKSPACE_ROOT_ERROR = (
     "SENTRYGATE_WORKSPACE_ROOT or --workspace-root is required"
 )
@@ -25,6 +27,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--workspace-root",
         help="Explicit workspace root protected by SentryGate.",
+    )
+    parser.add_argument(
+        "--audit-log-path",
+        help="Optional local JSONL audit log path for persistent observability.",
     )
     return parser.parse_args(argv)
 
@@ -50,8 +56,26 @@ def resolve_workspace_root(cli_workspace_root: str | None = None) -> Path:
     return resolved_workspace_root
 
 
-def create_service(workspace_root: Path) -> SafeToolService:
-    return SafeToolService(workspace_root=workspace_root)
+def resolve_audit_log_path(cli_audit_log_path: str | None = None) -> Path | None:
+    audit_log_path = _first_nonblank(cli_audit_log_path)
+    if audit_log_path is None:
+        audit_log_path = _first_nonblank(os.environ.get(AUDIT_LOG_PATH_ENV))
+
+    if audit_log_path is None:
+        return None
+
+    return Path(audit_log_path).expanduser().resolve(strict=False)
+
+
+def create_service(
+    workspace_root: Path,
+    audit_log_path: str | Path | None = None,
+) -> SafeToolService:
+    audit_store = None
+    if audit_log_path is not None:
+        audit_store = JsonlAuditStore(audit_log_path)
+
+    return SafeToolService(workspace_root=workspace_root, audit_store=audit_store)
 
 
 def serialize_result(result: ToolExecutionResult) -> dict[str, object]:
@@ -97,7 +121,8 @@ def main(
     args = parse_args(argv)
     try:
         workspace_root = resolve_workspace_root(args.workspace_root)
-        service = create_service(workspace_root)
+        audit_log_path = resolve_audit_log_path(args.audit_log_path)
+        service = create_service(workspace_root, audit_log_path=audit_log_path)
     except WorkspaceRootError as error:
         print(str(error), file=sys.stderr)
         return 1

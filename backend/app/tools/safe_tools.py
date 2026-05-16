@@ -1,8 +1,12 @@
 import os
 import shlex
 import subprocess
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Protocol
+from uuid import uuid4
 
 from app.audit.models import AuditEvent
 from app.audit.store import AuditStore, InMemoryAuditStore
@@ -14,6 +18,15 @@ from app.tools.models import ToolExecutionResult
 
 MAX_AUDIT_SUMMARY_CHARS = 2_000
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass(frozen=True)
+class _AuditSpanContext:
+    trace_id: str
+    span_id: str
+    parent_span_id: str | None
+    started_at: datetime
+    started_perf_counter: float
 
 
 class RiskReviewProvider(Protocol):
@@ -48,6 +61,7 @@ class SafeToolService:
         path: str,
         session_id: str | None = None,
     ) -> ToolExecutionResult:
+        audit_context = self._start_audit_span(session_id)
         tool_call = ToolCall(
             tool_name="read_file",
             arguments={"path": path},
@@ -69,6 +83,7 @@ class SafeToolService:
                 risk_result=risk_result,
                 arguments_summary=argument_summary,
                 findings=argument_findings,
+                audit_context=audit_context,
             )
 
         try:
@@ -80,6 +95,7 @@ class SafeToolService:
                 arguments_summary=argument_summary,
                 raw_error=f"path_outside_workspace: {error}",
                 findings=argument_findings,
+                audit_context=audit_context,
             )
 
         try:
@@ -91,6 +107,7 @@ class SafeToolService:
                 arguments_summary=argument_summary,
                 raw_error=f"binary_file_not_supported: {error}",
                 findings=argument_findings,
+                audit_context=audit_context,
             )
         except OSError as error:
             return self._execution_error_result(
@@ -99,6 +116,7 @@ class SafeToolService:
                 arguments_summary=argument_summary,
                 raw_error=f"read_file_failed: {error}",
                 findings=argument_findings,
+                audit_context=audit_context,
             )
 
         masked_content, output_findings = self._mask_text(content)
@@ -115,6 +133,7 @@ class SafeToolService:
             output_summary=output_summary,
             findings=findings,
             executed=True,
+            audit_context=audit_context,
         )
         return ToolExecutionResult(
             ok=True,
@@ -131,6 +150,7 @@ class SafeToolService:
         content: str,
         session_id: str | None = None,
     ) -> ToolExecutionResult:
+        audit_context = self._start_audit_span(session_id)
         tool_call = ToolCall(
             tool_name="write_file",
             arguments={"path": path, "content": content},
@@ -155,6 +175,7 @@ class SafeToolService:
                 risk_result=risk_result,
                 arguments_summary=argument_summary,
                 findings=findings,
+                audit_context=audit_context,
             )
 
         try:
@@ -166,6 +187,7 @@ class SafeToolService:
                 arguments_summary=argument_summary,
                 raw_error=f"path_outside_workspace: {error}",
                 findings=findings,
+                audit_context=audit_context,
             )
 
         try:
@@ -177,6 +199,7 @@ class SafeToolService:
                 arguments_summary=argument_summary,
                 raw_error=f"write_file_failed: {error}",
                 findings=findings,
+                audit_context=audit_context,
             )
 
         output, output_findings = self._mask_text(
@@ -190,6 +213,7 @@ class SafeToolService:
             output_summary=self._bounded_summary(output),
             findings=findings,
             executed=True,
+            audit_context=audit_context,
         )
         return ToolExecutionResult(
             ok=True,
@@ -205,6 +229,7 @@ class SafeToolService:
         path: str,
         session_id: str | None = None,
     ) -> ToolExecutionResult:
+        audit_context = self._start_audit_span(session_id)
         tool_call = ToolCall(
             tool_name="list_directory",
             arguments={"path": path},
@@ -226,6 +251,7 @@ class SafeToolService:
                 risk_result=risk_result,
                 arguments_summary=argument_summary,
                 findings=argument_findings,
+                audit_context=audit_context,
             )
 
         try:
@@ -237,6 +263,7 @@ class SafeToolService:
                 arguments_summary=argument_summary,
                 raw_error=f"path_outside_workspace: {error}",
                 findings=argument_findings,
+                audit_context=audit_context,
             )
 
         try:
@@ -248,6 +275,7 @@ class SafeToolService:
                 arguments_summary=argument_summary,
                 raw_error=f"list_directory_failed: {error}",
                 findings=argument_findings,
+                audit_context=audit_context,
             )
 
         output = "\n".join(entries)
@@ -264,6 +292,7 @@ class SafeToolService:
             output_summary=output_summary,
             findings=findings,
             executed=True,
+            audit_context=audit_context,
         )
         return ToolExecutionResult(
             ok=True,
@@ -279,6 +308,7 @@ class SafeToolService:
         command: str,
         session_id: str | None = None,
     ) -> ToolExecutionResult:
+        audit_context = self._start_audit_span(session_id)
         tool_call = ToolCall(
             tool_name="run_command",
             arguments={"command": command},
@@ -300,6 +330,7 @@ class SafeToolService:
                 risk_result=risk_result,
                 arguments_summary=argument_summary,
                 findings=argument_findings,
+                audit_context=audit_context,
             )
 
         try:
@@ -311,6 +342,7 @@ class SafeToolService:
                 arguments_summary=argument_summary,
                 raw_error=f"empty_command: {error}",
                 findings=argument_findings,
+                audit_context=audit_context,
             )
 
         try:
@@ -330,6 +362,7 @@ class SafeToolService:
                 arguments_summary=argument_summary,
                 raw_error=f"run_command_failed: {error}",
                 findings=argument_findings,
+                audit_context=audit_context,
             )
 
         raw_output = (
@@ -346,6 +379,7 @@ class SafeToolService:
             output_summary=self._bounded_summary(masked_output),
             findings=findings,
             executed=True,
+            audit_context=audit_context,
         )
         return ToolExecutionResult(
             ok=completed.returncode == 0,
@@ -362,6 +396,7 @@ class SafeToolService:
         risk_result: RiskResult,
         arguments_summary: str,
         findings: tuple[MaskingFinding, ...],
+        audit_context: _AuditSpanContext,
     ) -> ToolExecutionResult:
         raw_error = (
             "operation_blocked"
@@ -377,6 +412,7 @@ class SafeToolService:
             output_summary=error,
             findings=findings,
             executed=False,
+            audit_context=audit_context,
         )
         return ToolExecutionResult(
             ok=False,
@@ -394,6 +430,7 @@ class SafeToolService:
         arguments_summary: str,
         raw_error: str,
         findings: tuple[MaskingFinding, ...],
+        audit_context: _AuditSpanContext,
     ) -> ToolExecutionResult:
         error, error_findings = self._mask_text(raw_error)
         findings = self._merge_findings(findings, error_findings)
@@ -404,6 +441,7 @@ class SafeToolService:
             output_summary=self._bounded_summary(error),
             findings=findings,
             executed=False,
+            audit_context=audit_context,
         )
         return ToolExecutionResult(
             ok=False,
@@ -421,6 +459,7 @@ class SafeToolService:
         arguments_summary: str,
         raw_error: str,
         findings: tuple[MaskingFinding, ...],
+        audit_context: _AuditSpanContext,
     ) -> ToolExecutionResult:
         error, error_findings = self._mask_text(raw_error)
         findings = self._merge_findings(findings, error_findings)
@@ -431,6 +470,7 @@ class SafeToolService:
             output_summary=self._bounded_summary(error),
             findings=findings,
             executed=True,
+            audit_context=audit_context,
         )
         return ToolExecutionResult(
             ok=False,
@@ -449,10 +489,22 @@ class SafeToolService:
         output_summary: str | None,
         findings: tuple[MaskingFinding, ...],
         executed: bool,
+        audit_context: _AuditSpanContext,
     ) -> None:
+        ended_at = datetime.now(UTC)
+        latency_ms = max(
+            (perf_counter() - audit_context.started_perf_counter) * 1000,
+            0.0,
+        )
         self.audit_store.append(
             AuditEvent(
                 session_id=tool_call.session_id,
+                trace_id=audit_context.trace_id,
+                span_id=audit_context.span_id,
+                parent_span_id=audit_context.parent_span_id,
+                started_at=audit_context.started_at,
+                ended_at=ended_at,
+                latency_ms=latency_ms,
                 tool_name=tool_call.tool_name,
                 decision=risk_result.decision,
                 risk_score=risk_result.risk_score,
@@ -466,6 +518,16 @@ class SafeToolService:
                 masked_findings=findings,
                 executed=executed,
             )
+        )
+
+    @staticmethod
+    def _start_audit_span(session_id: str | None) -> _AuditSpanContext:
+        return _AuditSpanContext(
+            trace_id=session_id or str(uuid4()),
+            span_id=str(uuid4()),
+            parent_span_id=None,
+            started_at=datetime.now(UTC),
+            started_perf_counter=perf_counter(),
         )
 
     def _review_risk_result(

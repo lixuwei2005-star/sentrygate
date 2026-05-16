@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from app.audit.models import AuditEvent
 from app.audit.store import InMemoryAuditStore
 from app.risk.models import RiskResult, ToolCall
 from app.risk.scorer import RiskScorer
@@ -40,6 +41,47 @@ def test_blocked_read_file_env_does_not_read_and_audits(tmp_path: Path) -> None:
     assert events[0].tool_name == "read_file"
     assert events[0].executed is False
     assert secret not in events[0].model_dump_json()
+
+
+def test_audit_event_supports_optional_observability_fields() -> None:
+    event = AuditEvent(
+        session_id="session-1",
+        tool_name="read_file",
+        decision="allow",
+        risk_score=10,
+        reasons=["safe_file_read"],
+        arguments_summary="path=README.md",
+        output_summary="read_file succeeded; chars=5; masked_findings=0",
+        executed=True,
+    )
+
+    assert event.trace_id is None
+    assert event.span_id is None
+    assert event.parent_span_id is None
+    assert event.started_at is None
+    assert event.ended_at is None
+    assert event.latency_ms is None
+
+
+def test_safe_tool_service_records_trace_span_and_latency(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "README.md").write_text("hello", encoding="utf-8")
+    store = InMemoryAuditStore()
+    service = SafeToolService(workspace_root=tmp_path, audit_store=store)
+
+    result = service.sentry_read_file("README.md", session_id="session-1")
+
+    assert result.ok is True
+    event = store.list_events()[0]
+    assert event.trace_id == "session-1"
+    assert event.span_id is not None
+    assert event.parent_span_id is None
+    assert event.started_at is not None
+    assert event.ended_at is not None
+    assert event.ended_at >= event.started_at
+    assert event.latency_ms is not None
+    assert event.latency_ms >= 0
 
 
 def test_require_approval_write_file_does_not_write_and_audits(
