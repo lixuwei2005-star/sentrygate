@@ -8,13 +8,20 @@ that boundary: it never reads protected workspace files, never calls MCP
 tools, and never executes commands.
 """
 
-from datetime import UTC, datetime
+import sys
+from pathlib import Path
 
-import streamlit as st
+_BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(_BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_ROOT))
 
-from app.audit.metrics import summarize_audit_events
-from app.audit.models import AuditEvent
-from dashboard._data import (
+from datetime import UTC, datetime  # noqa: E402
+
+import streamlit as st  # noqa: E402
+
+from app.audit.metrics import summarize_audit_events  # noqa: E402
+from app.audit.models import AuditEvent  # noqa: E402
+from dashboard._data import (  # noqa: E402
     LoadResult,
     build_latency_series,
     build_recent_events_dataframe,
