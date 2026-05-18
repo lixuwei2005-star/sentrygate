@@ -266,6 +266,14 @@ sidebar.
 This is a local prototype that visualizes MCP-routed tool calls only. It is not
 production-grade monitoring and it is not a full sandbox.
 
+## AgentOps Dashboard Preview
+
+![SentryGate AgentOps Dashboard](docs/assets/photo_1_2026-05-18_22-49-46.jpg)
+![SentryGate AgentOps Dashboard](docs/assets/photo_2_2026-05-18_22-49-46.jpg)
+![SentryGate AgentOps Dashboard](docs/assets/photo_2026-05-18_22-50-54.jpg)
+
+The dashboard reads masked JSONL audit events and visualizes MCP-routed tool-call decisions, risk scores, latency, and masked findings.
+
 ## Roadmap
 
 Possible future work:

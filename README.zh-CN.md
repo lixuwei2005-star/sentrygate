@@ -277,6 +277,14 @@ Streamlit 会在本地浏览器中打开 dashboard。默认读取
 这是一个本地原型，只可视化经过 MCP 路由的工具调用。它不是生产级监控，也不是
 完整沙箱。
 
+## AgentOps Dashboard 预览
+
+![SentryGate AgentOps Dashboard](docs/assets/photo_1_2026-05-18_22-49-46.jpg)
+![SentryGate AgentOps Dashboard](docs/assets/photo_2_2026-05-18_22-49-46.jpg)
+![SentryGate AgentOps Dashboard](docs/assets/photo_2026-05-18_22-50-54.jpg)
+
+该 Dashboard 读取脱敏后的 JSONL 审计事件，用于可视化经过 MCP 路由的工具调用决策、风险分数、延迟和脱敏命中情况。
+
 ## 本地 Demo
 
 本地 demo 的入口是：
