@@ -139,7 +139,7 @@ RiskScorer -> optional LM Studio review for medium-risk calls -> conservative me
 cd backend
 uv run pytest
 uv run ruff check .
-uv run mypy app
+uv run mypy app dashboard
 ```
 
 ## 启动 MCP Server
@@ -284,6 +284,14 @@ Streamlit 会在本地浏览器中打开 dashboard。默认读取
 ![SentryGate AgentOps Dashboard](docs/assets/photo_2026-05-18_22-50-54.jpg)
 
 该 Dashboard 读取脱敏后的 JSONL 审计事件，用于可视化经过 MCP 路由的工具调用决策、风险分数、延迟和脱敏命中情况。
+
+## 项目证据文档
+
+如果你是面试官或项目 reviewer，可以先阅读下面这些文档，了解这个项目为什么这样设计、如何验证，以及 Codex Desktop 通过 MCP 调用时观察到了什么结果。
+
+- [设计决策说明](docs/design-decisions.md) — 解释 MCP-only 边界、为什么规则优先于 LM Studio、为什么 `.env` 通过路径阻断、以及为什么审计日志只保存脱敏摘要。
+- [评估报告](docs/evaluation.md) — 记录自动化测试、静态检查、隐私脱敏/风险评分覆盖范围、Dashboard 验证，以及哪些指标没有测量。
+- [Codex MCP 案例研究](docs/case-study-codex.md) — 记录真实 Codex Desktop MCP 路由调用，例如 `sentry_read_file("README.md")`、`sentry_read_file(".env")` 和 `sentry_write_file("test.txt", "hello")`。
 
 ## 本地 Demo
 

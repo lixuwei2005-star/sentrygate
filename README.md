@@ -123,7 +123,7 @@ From the `backend` directory:
 cd backend
 uv run pytest
 uv run ruff check .
-uv run mypy app
+uv run mypy app dashboard
 ```
 
 ## Run the MCP Server
@@ -273,6 +273,14 @@ production-grade monitoring and it is not a full sandbox.
 ![SentryGate AgentOps Dashboard](docs/assets/photo_2026-05-18_22-50-54.jpg)
 
 The dashboard reads masked JSONL audit events and visualizes MCP-routed tool-call decisions, risk scores, latency, and masked findings.
+
+## Project Evidence
+
+For reviewers, the following documents explain why the system is designed this way, how it was verified, and what was observed during real Codex Desktop MCP testing.
+
+- [Design Decisions](docs/design-decisions.md) — explains the MCP-only boundary, why deterministic rules run before LM Studio review, why `.env` is blocked by path, and why audit logs store masked summaries only.
+- [Evaluation Report](docs/evaluation.md) — records automated tests, static checks, privacy/risk coverage, dashboard verification, and what was not measured.
+- [Codex MCP Case Study](docs/case-study-codex.md) — documents real MCP-routed Codex Desktop calls such as `sentry_read_file("README.md")`, `sentry_read_file(".env")`, and `sentry_write_file("test.txt", "hello")`.
 
 ## Roadmap
 
