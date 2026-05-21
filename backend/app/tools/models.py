@@ -12,3 +12,4 @@ class ToolExecutionResult(BaseModel):
     output: str | None = None
     error: str | None = None
     masked_findings: tuple[MaskingFinding, ...] = ()
+    approval_request_id: str | None = None

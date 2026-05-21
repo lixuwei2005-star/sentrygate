@@ -229,6 +229,7 @@ def test_serialize_result_returns_safe_json_compatible_data() -> None:
         "masked_findings": [
             {"kind": "API_KEY", "token": "[API_KEY_001]"},
         ],
+        "approval_request_id": None,
     }
     assert raw_secret not in json.dumps(serialized)
 

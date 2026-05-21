@@ -2,22 +2,26 @@ import os
 import shlex
 import subprocess
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Protocol
 from uuid import uuid4
 
+from app.approvals.models import ApprovalRequest
+from app.approvals.store import ApprovalStoreError, InMemoryApprovalStore
 from app.audit.models import AuditEvent
 from app.audit.store import AuditStore, InMemoryAuditStore
 from app.privacy.masker import MaskingFinding, PrivacyMasker
-from app.risk.models import RiskResult, ToolCall
+from app.risk.models import RiskDecision, RiskResult, ToolCall
 from app.risk.policy import ALLOW_MAX_SCORE, REQUIRE_APPROVAL_MAX_SCORE
 from app.risk.scorer import RiskScorer
 from app.tools.models import ToolExecutionResult
 
 MAX_AUDIT_SUMMARY_CHARS = 2_000
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 5.0
+DEFAULT_APPROVAL_TTL_MINUTES = 30
+APPROVABLE_TOOL_NAMES = frozenset({"write_file", "run_command"})
 
 
 @dataclass(frozen=True)
@@ -27,6 +31,13 @@ class _AuditSpanContext:
     parent_span_id: str | None
     started_at: datetime
     started_perf_counter: float
+
+
+@dataclass(frozen=True)
+class _ApprovalExecutionPayload:
+    tool_name: str
+    arguments: dict[str, object]
+    session_id: str | None
 
 
 class RiskReviewProvider(Protocol):
@@ -46,6 +57,7 @@ class SafeToolService:
         risk_scorer: RiskScorer | None = None,
         masker: PrivacyMasker | None = None,
         audit_store: AuditStore | None = None,
+        approval_store: InMemoryApprovalStore | None = None,
         command_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
         risk_reviewer: RiskReviewProvider | None = None,
     ) -> None:
@@ -53,6 +65,7 @@ class SafeToolService:
         self.risk_scorer = risk_scorer or RiskScorer(self.workspace_root)
         self.masker = masker or PrivacyMasker()
         self.audit_store = audit_store or InMemoryAuditStore()
+        self.approval_store = approval_store or InMemoryApprovalStore()
         self.command_timeout_seconds = command_timeout_seconds
         self.risk_reviewer = risk_reviewer or self._default_risk_reviewer()
 
@@ -170,7 +183,7 @@ class SafeToolService:
         )
 
         if risk_result.decision != "allow":
-            return self._denied_result(
+            return self._approval_or_denied_result(
                 tool_call=tool_call,
                 risk_result=risk_result,
                 arguments_summary=argument_summary,
@@ -178,51 +191,14 @@ class SafeToolService:
                 audit_context=audit_context,
             )
 
-        try:
-            target_path = self._resolve_workspace_path(path)
-        except PermissionError as error:
-            return self._setup_error_result(
-                tool_call=tool_call,
-                risk_result=risk_result,
-                arguments_summary=argument_summary,
-                raw_error=f"path_outside_workspace: {error}",
-                findings=findings,
-                audit_context=audit_context,
-            )
-
-        try:
-            target_path.write_text(content, encoding="utf-8")
-        except OSError as error:
-            return self._execution_error_result(
-                tool_call=tool_call,
-                risk_result=risk_result,
-                arguments_summary=argument_summary,
-                raw_error=f"write_file_failed: {error}",
-                findings=findings,
-                audit_context=audit_context,
-            )
-
-        output, output_findings = self._mask_text(
-            f"write_file succeeded; chars={len(content)}"
-        )
-        findings = self._merge_findings(findings, output_findings)
-        self._append_audit_event(
+        result, _ = self._execute_write_file(
             tool_call=tool_call,
             risk_result=risk_result,
             arguments_summary=argument_summary,
-            output_summary=self._bounded_summary(output),
             findings=findings,
-            executed=True,
             audit_context=audit_context,
         )
-        return ToolExecutionResult(
-            ok=True,
-            decision=risk_result.decision,
-            risk_score=risk_result.risk_score,
-            reasons=risk_result.reasons,
-            output=output,
-            masked_findings=findings,
-        )
+        return result
 
     def sentry_list_directory(
         self,
@@ -325,7 +301,7 @@ class SafeToolService:
         )
 
         if risk_result.decision != "allow":
-            return self._denied_result(
+            return self._approval_or_denied_result(
                 tool_call=tool_call,
                 risk_result=risk_result,
                 arguments_summary=argument_summary,
@@ -333,16 +309,394 @@ class SafeToolService:
                 audit_context=audit_context,
             )
 
+        result, _ = self._execute_run_command(
+            tool_call=tool_call,
+            risk_result=risk_result,
+            arguments_summary=argument_summary,
+            findings=argument_findings,
+            audit_context=audit_context,
+        )
+        return result
+
+    def approve_request(self, request_id: str) -> ToolExecutionResult:
+        current_request = self.approval_store.get(request_id)
+        audit_context = self._start_audit_span(
+            None if current_request is None else current_request.session_id
+        )
         try:
-            argv = self._command_argv(command)
-        except ValueError as error:
-            return self._setup_error_result(
+            request = self.approval_store.approve(request_id)
+        except ApprovalStoreError as error:
+            return self._approval_store_error_result(
+                request_id=request_id,
+                raw_error=str(error),
+                audit_context=audit_context,
+            )
+
+        self._append_approval_lifecycle_event(
+            event_name="approval_request_approved",
+            request=request,
+            decision="require_approval",
+            risk_score=request.risk_score,
+            reasons=["approval_request_approved", *request.reasons],
+            output_summary=(
+                f"approval_request_approved; request_id={request.request_id}; "
+                "status=approved"
+            ),
+            executed=False,
+            audit_context=audit_context,
+        )
+
+        payload = self.approval_store.get_execution_payload(request_id)
+        if not isinstance(payload, _ApprovalExecutionPayload):
+            self.approval_store.discard_execution_payload(request_id)
+            self._append_approval_lifecycle_event(
+                event_name="approval_execution_denied",
+                request=request,
+                decision="block",
+                risk_score=100,
+                reasons=["approval_execution_denied", "approval_payload_missing"],
+                output_summary=(
+                    f"approval_execution_denied; request_id={request.request_id}; "
+                    "reason=approval_payload_missing"
+                ),
+                executed=False,
+                audit_context=audit_context,
+            )
+            return self._approval_denied_result(
+                risk_score=100,
+                reasons=["approval_payload_missing"],
+                raw_error="operation_blocked",
+            )
+
+        tool_call = ToolCall(
+            tool_name=payload.tool_name,
+            arguments=dict(payload.arguments),
+            session_id=payload.session_id,
+        )
+        arguments_summary, findings = self._approval_argument_summary_and_findings(
+            tool_call
+        )
+        risk_result = self.risk_scorer.score_tool_call(tool_call)
+        risk_result = self._review_risk_result(
+            tool_call,
+            risk_result,
+            arguments_summary,
+        )
+
+        if risk_result.decision == "block":
+            self.approval_store.discard_execution_payload(request_id)
+            self._append_approval_lifecycle_event(
+                event_name="approval_execution_denied",
+                request=request,
+                decision=risk_result.decision,
+                risk_score=risk_result.risk_score,
+                reasons=["approval_execution_denied", *risk_result.reasons],
+                output_summary=(
+                    f"approval_execution_denied; request_id={request.request_id}; "
+                    "reason=policy_block"
+                ),
+                executed=False,
+                audit_context=audit_context,
+                findings=findings,
+            )
+            return self._approval_denied_result(
+                risk_score=risk_result.risk_score,
+                reasons=risk_result.reasons,
+                raw_error="operation_blocked",
+                findings=findings,
+            )
+
+        if tool_call.tool_name == "write_file":
+            result, attempted = self._execute_write_file(
                 tool_call=tool_call,
                 risk_result=risk_result,
-                arguments_summary=argument_summary,
-                raw_error=f"empty_command: {error}",
-                findings=argument_findings,
+                arguments_summary=arguments_summary,
+                findings=findings,
                 audit_context=audit_context,
+            )
+        elif tool_call.tool_name == "run_command":
+            result, attempted = self._execute_run_command(
+                tool_call=tool_call,
+                risk_result=risk_result,
+                arguments_summary=arguments_summary,
+                findings=findings,
+                audit_context=audit_context,
+            )
+        else:
+            self.approval_store.discard_execution_payload(request_id)
+            self._append_approval_lifecycle_event(
+                event_name="approval_execution_denied",
+                request=request,
+                decision="block",
+                risk_score=100,
+                reasons=["approval_execution_denied", "approval_tool_not_supported"],
+                output_summary=(
+                    f"approval_execution_denied; request_id={request.request_id}; "
+                    "reason=approval_tool_not_supported"
+                ),
+                executed=False,
+                audit_context=audit_context,
+                findings=findings,
+            )
+            return self._approval_denied_result(
+                risk_score=100,
+                reasons=["approval_tool_not_supported"],
+                raw_error="operation_blocked",
+                findings=findings,
+            )
+
+        if attempted:
+            try:
+                executed_request = self.approval_store.mark_executed(request_id)
+            except ApprovalStoreError:
+                executed_request = request
+            self._append_approval_lifecycle_event(
+                event_name="approval_operation_executed",
+                request=executed_request,
+                decision=risk_result.decision,
+                risk_score=risk_result.risk_score,
+                reasons=["approval_operation_executed", *risk_result.reasons],
+                output_summary=(
+                    f"approval_operation_executed; request_id={request.request_id}; "
+                    "status=executed"
+                ),
+                executed=True,
+                audit_context=audit_context,
+                findings=result.masked_findings,
+            )
+        else:
+            self.approval_store.discard_execution_payload(request_id)
+
+        return result
+
+    def reject_request(self, request_id: str) -> ApprovalRequest:
+        current_request = self.approval_store.get(request_id)
+        audit_context = self._start_audit_span(
+            None if current_request is None else current_request.session_id
+        )
+        request = self.approval_store.reject(request_id)
+        self._append_approval_lifecycle_event(
+            event_name="approval_request_rejected",
+            request=request,
+            decision="require_approval",
+            risk_score=request.risk_score,
+            reasons=["approval_request_rejected", *request.reasons],
+            output_summary=(
+                f"approval_request_rejected; request_id={request.request_id}; "
+                "status=rejected"
+            ),
+            executed=False,
+            audit_context=audit_context,
+        )
+        return request
+
+    def _approval_or_denied_result(
+        self,
+        tool_call: ToolCall,
+        risk_result: RiskResult,
+        arguments_summary: str,
+        findings: tuple[MaskingFinding, ...],
+        audit_context: _AuditSpanContext,
+    ) -> ToolExecutionResult:
+        if (
+            risk_result.decision == "require_approval"
+            and tool_call.tool_name in APPROVABLE_TOOL_NAMES
+        ):
+            return self._create_approval_result(
+                tool_call=tool_call,
+                risk_result=risk_result,
+                arguments_summary=arguments_summary,
+                findings=findings,
+                audit_context=audit_context,
+            )
+
+        return self._denied_result(
+            tool_call=tool_call,
+            risk_result=risk_result,
+            arguments_summary=arguments_summary,
+            findings=findings,
+            audit_context=audit_context,
+        )
+
+    def _create_approval_result(
+        self,
+        tool_call: ToolCall,
+        risk_result: RiskResult,
+        arguments_summary: str,
+        findings: tuple[MaskingFinding, ...],
+        audit_context: _AuditSpanContext,
+    ) -> ToolExecutionResult:
+        request = ApprovalRequest(
+            session_id=tool_call.session_id,
+            tool_name=tool_call.tool_name,
+            arguments_summary=arguments_summary,
+            original_arguments=self._display_safe_original_arguments(
+                tool_call,
+                arguments_summary,
+            ),
+            risk_score=risk_result.risk_score,
+            reasons=risk_result.reasons,
+            expires_at=datetime.now(UTC)
+            + timedelta(minutes=DEFAULT_APPROVAL_TTL_MINUTES),
+        )
+        stored_request = self.approval_store.create(request)
+        self.approval_store.attach_execution_payload(
+            stored_request.request_id,
+            _ApprovalExecutionPayload(
+                tool_name=tool_call.tool_name,
+                arguments=dict(tool_call.arguments),
+                session_id=tool_call.session_id,
+            ),
+        )
+
+        error, error_findings = self._mask_text("operation_requires_approval")
+        findings = self._merge_findings(findings, error_findings)
+        self._append_audit_event(
+            tool_call=tool_call,
+            risk_result=risk_result,
+            arguments_summary=arguments_summary,
+            output_summary=error,
+            findings=findings,
+            executed=False,
+            audit_context=audit_context,
+        )
+        self._append_approval_lifecycle_event(
+            event_name="approval_request_created",
+            request=stored_request,
+            decision=risk_result.decision,
+            risk_score=risk_result.risk_score,
+            reasons=["approval_request_created", *risk_result.reasons],
+            output_summary=(
+                f"approval_request_created; request_id={stored_request.request_id}; "
+                "status=pending"
+            ),
+            executed=False,
+            audit_context=audit_context,
+            findings=findings,
+        )
+        return ToolExecutionResult(
+            ok=False,
+            decision=risk_result.decision,
+            risk_score=risk_result.risk_score,
+            reasons=risk_result.reasons,
+            error=error,
+            masked_findings=findings,
+            approval_request_id=stored_request.request_id,
+        )
+
+    def _execute_write_file(
+        self,
+        tool_call: ToolCall,
+        risk_result: RiskResult,
+        arguments_summary: str,
+        findings: tuple[MaskingFinding, ...],
+        audit_context: _AuditSpanContext,
+    ) -> tuple[ToolExecutionResult, bool]:
+        path_value = tool_call.arguments.get("path")
+        content_value = tool_call.arguments.get("content")
+        if not isinstance(path_value, str) or not isinstance(content_value, str):
+            return (
+                self._setup_error_result(
+                    tool_call=tool_call,
+                    risk_result=risk_result,
+                    arguments_summary=arguments_summary,
+                    raw_error="invalid_write_file_arguments",
+                    findings=findings,
+                    audit_context=audit_context,
+                ),
+                False,
+            )
+
+        try:
+            target_path = self._resolve_workspace_path(path_value)
+        except PermissionError as error:
+            return (
+                self._setup_error_result(
+                    tool_call=tool_call,
+                    risk_result=risk_result,
+                    arguments_summary=arguments_summary,
+                    raw_error=f"path_outside_workspace: {error}",
+                    findings=findings,
+                    audit_context=audit_context,
+                ),
+                False,
+            )
+
+        try:
+            target_path.write_text(content_value, encoding="utf-8")
+        except OSError as error:
+            return (
+                self._execution_error_result(
+                    tool_call=tool_call,
+                    risk_result=risk_result,
+                    arguments_summary=arguments_summary,
+                    raw_error=f"write_file_failed: {error}",
+                    findings=findings,
+                    audit_context=audit_context,
+                ),
+                True,
+            )
+
+        output, output_findings = self._mask_text(
+            f"write_file succeeded; chars={len(content_value)}"
+        )
+        findings = self._merge_findings(findings, output_findings)
+        self._append_audit_event(
+            tool_call=tool_call,
+            risk_result=risk_result,
+            arguments_summary=arguments_summary,
+            output_summary=self._bounded_summary(output),
+            findings=findings,
+            executed=True,
+            audit_context=audit_context,
+        )
+        return (
+            ToolExecutionResult(
+                ok=True,
+                decision=risk_result.decision,
+                risk_score=risk_result.risk_score,
+                reasons=risk_result.reasons,
+                output=output,
+                masked_findings=findings,
+            ),
+            True,
+        )
+
+    def _execute_run_command(
+        self,
+        tool_call: ToolCall,
+        risk_result: RiskResult,
+        arguments_summary: str,
+        findings: tuple[MaskingFinding, ...],
+        audit_context: _AuditSpanContext,
+    ) -> tuple[ToolExecutionResult, bool]:
+        command_value = tool_call.arguments.get("command")
+        if not isinstance(command_value, str):
+            return (
+                self._setup_error_result(
+                    tool_call=tool_call,
+                    risk_result=risk_result,
+                    arguments_summary=arguments_summary,
+                    raw_error="invalid_run_command_arguments",
+                    findings=findings,
+                    audit_context=audit_context,
+                ),
+                False,
+            )
+
+        try:
+            argv = self._command_argv(command_value)
+        except ValueError as error:
+            return (
+                self._setup_error_result(
+                    tool_call=tool_call,
+                    risk_result=risk_result,
+                    arguments_summary=arguments_summary,
+                    raw_error=f"empty_command: {error}",
+                    findings=findings,
+                    audit_context=audit_context,
+                ),
+                False,
             )
 
         try:
@@ -356,13 +710,16 @@ class SafeToolService:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as error:
-            return self._execution_error_result(
-                tool_call=tool_call,
-                risk_result=risk_result,
-                arguments_summary=argument_summary,
-                raw_error=f"run_command_failed: {error}",
-                findings=argument_findings,
-                audit_context=audit_context,
+            return (
+                self._execution_error_result(
+                    tool_call=tool_call,
+                    risk_result=risk_result,
+                    arguments_summary=arguments_summary,
+                    raw_error=f"run_command_failed: {error}",
+                    findings=findings,
+                    audit_context=audit_context,
+                ),
+                True,
             )
 
         raw_output = (
@@ -371,23 +728,26 @@ class SafeToolService:
             f"stderr:\n{completed.stderr}"
         )
         masked_output, output_findings = self._mask_text(raw_output)
-        findings = self._merge_findings(argument_findings, output_findings)
+        findings = self._merge_findings(findings, output_findings)
         self._append_audit_event(
             tool_call=tool_call,
             risk_result=risk_result,
-            arguments_summary=argument_summary,
+            arguments_summary=arguments_summary,
             output_summary=self._bounded_summary(masked_output),
             findings=findings,
             executed=True,
             audit_context=audit_context,
         )
-        return ToolExecutionResult(
-            ok=completed.returncode == 0,
-            decision=risk_result.decision,
-            risk_score=risk_result.risk_score,
-            reasons=risk_result.reasons,
-            output=masked_output,
-            masked_findings=findings,
+        return (
+            ToolExecutionResult(
+                ok=completed.returncode == 0,
+                decision=risk_result.decision,
+                risk_score=risk_result.risk_score,
+                reasons=risk_result.reasons,
+                output=masked_output,
+                masked_findings=findings,
+            ),
+            True,
         )
 
     def _denied_result(
@@ -479,6 +839,165 @@ class SafeToolService:
             reasons=risk_result.reasons,
             error=error,
             masked_findings=findings,
+        )
+
+    def _approval_store_error_result(
+        self,
+        request_id: str,
+        raw_error: str,
+        audit_context: _AuditSpanContext,
+    ) -> ToolExecutionResult:
+        error, findings = self._mask_text(raw_error)
+        arguments_summary, argument_findings = self._mask_text(
+            f"request_id={request_id}"
+        )
+        findings = self._merge_findings(findings, argument_findings)
+        self.audit_store.append(
+            AuditEvent(
+                session_id=None,
+                trace_id=audit_context.trace_id,
+                span_id=audit_context.span_id,
+                parent_span_id=audit_context.parent_span_id,
+                started_at=audit_context.started_at,
+                ended_at=datetime.now(UTC),
+                latency_ms=max(
+                    (perf_counter() - audit_context.started_perf_counter) * 1000,
+                    0.0,
+                ),
+                tool_name="approval_execution_denied",
+                decision="block",
+                risk_score=100,
+                reasons=["approval_execution_denied", error],
+                arguments_summary=self._bounded_summary(arguments_summary),
+                output_summary="approval_execution_denied",
+                masked_findings=findings,
+                executed=False,
+            )
+        )
+        return ToolExecutionResult(
+            ok=False,
+            decision="block",
+            risk_score=100,
+            reasons=[error],
+            error=error,
+            masked_findings=findings,
+        )
+
+    def _approval_denied_result(
+        self,
+        risk_score: int,
+        reasons: list[str],
+        raw_error: str,
+        findings: tuple[MaskingFinding, ...] = (),
+    ) -> ToolExecutionResult:
+        error, error_findings = self._mask_text(raw_error)
+        findings = self._merge_findings(findings, error_findings)
+        return ToolExecutionResult(
+            ok=False,
+            decision="block",
+            risk_score=risk_score,
+            reasons=reasons,
+            error=error,
+            masked_findings=findings,
+        )
+
+    def _display_safe_original_arguments(
+        self,
+        tool_call: ToolCall,
+        arguments_summary: str,
+    ) -> dict[str, object]:
+        if tool_call.tool_name == "write_file":
+            path_value = tool_call.arguments.get("path")
+            content_value = tool_call.arguments.get("content")
+            path_display = (
+                self._safe_relative_display(path_value)
+                if isinstance(path_value, str)
+                else "<invalid>"
+            )
+            masked_path, _ = self._mask_text(path_display)
+            return {
+                "path": masked_path,
+                "content_chars": (
+                    len(content_value) if isinstance(content_value, str) else 0
+                ),
+            }
+
+        if tool_call.tool_name == "run_command":
+            return {"command_summary": arguments_summary}
+
+        return {"arguments_summary": arguments_summary}
+
+    def _approval_argument_summary_and_findings(
+        self,
+        tool_call: ToolCall,
+    ) -> tuple[str, tuple[MaskingFinding, ...]]:
+        if tool_call.tool_name == "write_file":
+            path_value = tool_call.arguments.get("path")
+            content_value = tool_call.arguments.get("content")
+            path_display = (
+                self._safe_relative_display(path_value)
+                if isinstance(path_value, str)
+                else "<invalid>"
+            )
+            masked_path, path_findings = self._mask_text(path_display)
+            content_text = content_value if isinstance(content_value, str) else ""
+            _, content_findings = self._mask_text(content_text)
+            return (
+                self._bounded_summary(
+                    f"path={masked_path}; content_chars={len(content_text)}"
+                ),
+                self._merge_findings(path_findings, content_findings),
+            )
+
+        if tool_call.tool_name == "run_command":
+            command_value = tool_call.arguments.get("command")
+            command_text = command_value if isinstance(command_value, str) else ""
+            return self._mask_text(self._bounded_summary(f"command={command_text}"))
+
+        return "unsupported_approval_tool", ()
+
+    def _append_approval_lifecycle_event(
+        self,
+        event_name: str,
+        request: ApprovalRequest,
+        decision: RiskDecision,
+        risk_score: int,
+        reasons: list[str],
+        output_summary: str,
+        executed: bool,
+        audit_context: _AuditSpanContext,
+        findings: tuple[MaskingFinding, ...] = (),
+    ) -> None:
+        raw_arguments_summary = (
+            f"request_id={request.request_id}; request_tool={request.tool_name}; "
+            f"{request.arguments_summary}"
+        )
+        arguments_summary, argument_findings = self._mask_text(raw_arguments_summary)
+        output_summary, output_findings = self._mask_text(output_summary)
+        findings = self._merge_findings(findings, argument_findings, output_findings)
+        ended_at = datetime.now(UTC)
+        latency_ms = max(
+            (perf_counter() - audit_context.started_perf_counter) * 1000,
+            0.0,
+        )
+        self.audit_store.append(
+            AuditEvent(
+                session_id=request.session_id,
+                trace_id=audit_context.trace_id,
+                span_id=audit_context.span_id,
+                parent_span_id=audit_context.parent_span_id,
+                started_at=audit_context.started_at,
+                ended_at=ended_at,
+                latency_ms=latency_ms,
+                tool_name=event_name,
+                decision=decision,
+                risk_score=risk_score,
+                reasons=reasons,
+                arguments_summary=self._bounded_summary(arguments_summary),
+                output_summary=self._bounded_summary(output_summary),
+                masked_findings=findings,
+                executed=executed,
+            )
         )
 
     def _append_audit_event(
@@ -706,6 +1225,7 @@ def configure_default_service(
     risk_scorer: RiskScorer | None = None,
     masker: PrivacyMasker | None = None,
     audit_store: AuditStore | None = None,
+    approval_store: InMemoryApprovalStore | None = None,
     command_timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
     risk_reviewer: RiskReviewProvider | None = None,
 ) -> None:
@@ -715,6 +1235,7 @@ def configure_default_service(
         risk_scorer=risk_scorer,
         masker=masker,
         audit_store=audit_store,
+        approval_store=approval_store,
         command_timeout_seconds=command_timeout_seconds,
         risk_reviewer=risk_reviewer,
     )

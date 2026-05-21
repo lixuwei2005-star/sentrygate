@@ -217,9 +217,9 @@ def test_audit_store_filters_by_session_and_limit() -> None:
     store = InMemoryAuditStore()
     service = SafeToolService(workspace_root=Path.cwd(), audit_store=store)
 
-    service.sentry_run_command("pytest --version", session_id="a")
-    service.sentry_run_command("pytest --version", session_id="b")
-    service.sentry_run_command("pytest --version", session_id="a")
+    service.sentry_read_file("pyproject.toml", session_id="a")
+    service.sentry_read_file("pyproject.toml", session_id="b")
+    service.sentry_read_file("pyproject.toml", session_id="a")
 
     assert [event.session_id for event in store.list_events()] == ["a", "b", "a"]
     assert [event.session_id for event in store.list_events(session_id="a")] == [
