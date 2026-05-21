@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import shlex
 import subprocess
@@ -38,6 +40,7 @@ class _ApprovalExecutionPayload:
     tool_name: str
     arguments: dict[str, object]
     session_id: str | None
+    fingerprint: str
 
 
 class RiskReviewProvider(Protocol):
@@ -183,6 +186,17 @@ class SafeToolService:
         )
 
         if risk_result.decision != "allow":
+            if risk_result.decision == "require_approval":
+                boundary_error = self._write_file_boundary_error(tool_call)
+                if boundary_error is not None:
+                    return self._workspace_boundary_block_result(
+                        tool_call=tool_call,
+                        risk_result=risk_result,
+                        arguments_summary=argument_summary,
+                        findings=findings,
+                        audit_context=audit_context,
+                    )
+
             return self._approval_or_denied_result(
                 tool_call=tool_call,
                 risk_result=risk_result,
@@ -348,24 +362,21 @@ class SafeToolService:
 
         payload = self.approval_store.get_execution_payload(request_id)
         if not isinstance(payload, _ApprovalExecutionPayload):
-            self.approval_store.discard_execution_payload(request_id)
-            self._append_approval_lifecycle_event(
-                event_name="approval_execution_denied",
+            return self._approval_execution_denied_result(
                 request=request,
-                decision="block",
-                risk_score=100,
-                reasons=["approval_execution_denied", "approval_payload_missing"],
-                output_summary=(
-                    f"approval_execution_denied; request_id={request.request_id}; "
-                    "reason=approval_payload_missing"
-                ),
-                executed=False,
-                audit_context=audit_context,
-            )
-            return self._approval_denied_result(
                 risk_score=100,
                 reasons=["approval_payload_missing"],
-                raw_error="operation_blocked",
+                reason_code="approval_payload_missing",
+                audit_context=audit_context,
+            )
+
+        if not self._approval_payload_matches_request(request, payload):
+            return self._approval_execution_denied_result(
+                request=request,
+                risk_score=100,
+                reasons=["approval_payload_mismatch"],
+                reason_code="approval_payload_mismatch",
+                audit_context=audit_context,
             )
 
         tool_call = ToolCall(
@@ -384,29 +395,30 @@ class SafeToolService:
         )
 
         if risk_result.decision == "block":
-            self.approval_store.discard_execution_payload(request_id)
-            self._append_approval_lifecycle_event(
-                event_name="approval_execution_denied",
+            return self._approval_execution_denied_result(
                 request=request,
-                decision=risk_result.decision,
-                risk_score=risk_result.risk_score,
-                reasons=["approval_execution_denied", *risk_result.reasons],
-                output_summary=(
-                    f"approval_execution_denied; request_id={request.request_id}; "
-                    "reason=policy_block"
-                ),
-                executed=False,
-                audit_context=audit_context,
-                findings=findings,
-            )
-            return self._approval_denied_result(
                 risk_score=risk_result.risk_score,
                 reasons=risk_result.reasons,
-                raw_error="operation_blocked",
+                reason_code="policy_block",
+                audit_context=audit_context,
                 findings=findings,
             )
 
         if tool_call.tool_name == "write_file":
+            boundary_error = self._write_file_boundary_error(tool_call)
+            if boundary_error is not None:
+                return self._approval_execution_denied_result(
+                    request=request,
+                    risk_score=100,
+                    reasons=self._prepend_unique_reason(
+                        "path_outside_workspace",
+                        risk_result.reasons,
+                    ),
+                    reason_code="path_outside_workspace",
+                    audit_context=audit_context,
+                    findings=findings,
+                )
+
             result, attempted = self._execute_write_file(
                 tool_call=tool_call,
                 risk_result=risk_result,
@@ -423,25 +435,12 @@ class SafeToolService:
                 audit_context=audit_context,
             )
         else:
-            self.approval_store.discard_execution_payload(request_id)
-            self._append_approval_lifecycle_event(
-                event_name="approval_execution_denied",
+            return self._approval_execution_denied_result(
                 request=request,
-                decision="block",
-                risk_score=100,
-                reasons=["approval_execution_denied", "approval_tool_not_supported"],
-                output_summary=(
-                    f"approval_execution_denied; request_id={request.request_id}; "
-                    "reason=approval_tool_not_supported"
-                ),
-                executed=False,
-                audit_context=audit_context,
-                findings=findings,
-            )
-            return self._approval_denied_result(
                 risk_score=100,
                 reasons=["approval_tool_not_supported"],
-                raw_error="operation_blocked",
+                reason_code="approval_tool_not_supported",
+                audit_context=audit_context,
                 findings=findings,
             )
 
@@ -540,12 +539,18 @@ class SafeToolService:
             + timedelta(minutes=DEFAULT_APPROVAL_TTL_MINUTES),
         )
         stored_request = self.approval_store.create(request)
+        raw_arguments = dict(tool_call.arguments)
         self.approval_store.attach_execution_payload(
             stored_request.request_id,
             _ApprovalExecutionPayload(
                 tool_name=tool_call.tool_name,
-                arguments=dict(tool_call.arguments),
+                arguments=raw_arguments,
                 session_id=tool_call.session_id,
+                fingerprint=self._approval_payload_fingerprint(
+                    request_id=stored_request.request_id,
+                    tool_name=tool_call.tool_name,
+                    arguments=raw_arguments,
+                ),
             ),
         )
 
@@ -900,6 +905,112 @@ class SafeToolService:
             error=error,
             masked_findings=findings,
         )
+
+    def _approval_execution_denied_result(
+        self,
+        request: ApprovalRequest,
+        risk_score: int,
+        reasons: list[str],
+        reason_code: str,
+        audit_context: _AuditSpanContext,
+        findings: tuple[MaskingFinding, ...] = (),
+    ) -> ToolExecutionResult:
+        self.approval_store.discard_execution_payload(request.request_id)
+        self._append_approval_lifecycle_event(
+            event_name="approval_execution_denied",
+            request=request,
+            decision="block",
+            risk_score=risk_score,
+            reasons=["approval_execution_denied", *reasons],
+            output_summary=(
+                f"approval_execution_denied; request_id={request.request_id}; "
+                f"reason={reason_code}"
+            ),
+            executed=False,
+            audit_context=audit_context,
+            findings=findings,
+        )
+        return self._approval_denied_result(
+            risk_score=risk_score,
+            reasons=reasons,
+            raw_error="operation_blocked",
+            findings=findings,
+        )
+
+    def _workspace_boundary_block_result(
+        self,
+        tool_call: ToolCall,
+        risk_result: RiskResult,
+        arguments_summary: str,
+        findings: tuple[MaskingFinding, ...],
+        audit_context: _AuditSpanContext,
+    ) -> ToolExecutionResult:
+        block_result = RiskResult(
+            risk_score=100,
+            decision="block",
+            reasons=self._prepend_unique_reason(
+                "path_outside_workspace",
+                risk_result.reasons,
+            ),
+        )
+        return self._denied_result(
+            tool_call=tool_call,
+            risk_result=block_result,
+            arguments_summary=arguments_summary,
+            findings=findings,
+            audit_context=audit_context,
+        )
+
+    def _write_file_boundary_error(self, tool_call: ToolCall) -> str | None:
+        path_value = tool_call.arguments.get("path")
+        if not isinstance(path_value, str):
+            return None
+
+        try:
+            self._resolve_workspace_path(path_value)
+        except PermissionError as error:
+            return f"path_outside_workspace: {error}"
+
+        return None
+
+    def _approval_payload_matches_request(
+        self,
+        request: ApprovalRequest,
+        payload: _ApprovalExecutionPayload,
+    ) -> bool:
+        if payload.tool_name != request.tool_name:
+            return False
+
+        expected_fingerprint = self._approval_payload_fingerprint(
+            request_id=request.request_id,
+            tool_name=payload.tool_name,
+            arguments=payload.arguments,
+        )
+        return payload.fingerprint == expected_fingerprint
+
+    @staticmethod
+    def _approval_payload_fingerprint(
+        request_id: str,
+        tool_name: str,
+        arguments: dict[str, object],
+    ) -> str:
+        canonical_payload = json.dumps(
+            {
+                "request_id": request_id,
+                "tool_name": tool_name,
+                "arguments": arguments,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _prepend_unique_reason(reason: str, reasons: list[str]) -> list[str]:
+        if reason in reasons:
+            return reasons
+        return [reason, *reasons]
 
     def _display_safe_original_arguments(
         self,

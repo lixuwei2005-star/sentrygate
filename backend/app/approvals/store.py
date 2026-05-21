@@ -71,6 +71,8 @@ class InMemoryApprovalStore:
     def attach_execution_payload(self, request_id: str, payload: object) -> None:
         if request_id not in self._requests:
             raise ApprovalStoreError("approval_request_not_found")
+        if request_id in self._execution_payloads:
+            raise ApprovalStoreError("approval_execution_payload_already_exists")
         self._execution_payloads[request_id] = payload
 
     def get_execution_payload(self, request_id: str) -> object | None:

@@ -1,7 +1,11 @@
 import json
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
+from app.approvals.store import ApprovalStoreError
 from app.audit.store import InMemoryAuditStore
 from app.risk.models import RiskResult, ToolCall
 from app.risk.scorer import RiskScorer
@@ -166,6 +170,10 @@ def test_approve_write_file_reruns_risk_and_uses_original_private_payload(
     assert not (tmp_path / "smuggled.txt").exists()
     assert [call.tool_name for call in scorer.calls] == ["write_file", "write_file"]
     assert service.approval_store.get(result.approval_request_id).status == "executed"
+    assert (
+        service.approval_store.get_execution_payload(result.approval_request_id)
+        is None
+    )
     serialized_events = _serialized_events(store)
     assert "approval_operation_executed" in serialized_events
     assert raw_secret not in serialized_events
@@ -250,9 +258,152 @@ def test_approve_request_denies_if_rescore_blocks_and_is_not_pending(
     assert "second_call_blocks" in approved.reasons
     assert service.approval_store.list_pending() == []
     assert service.approval_store.get(result.approval_request_id).status == "approved"
+    assert (
+        service.approval_store.get_execution_payload(result.approval_request_id)
+        is None
+    )
     serialized_events = _serialized_events(store)
     assert "approval_execution_denied" in serialized_events
     assert "second_call_blocks" in serialized_events
+
+
+def test_outside_workspace_write_file_requires_approval_scorer_blocks_without_request(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    store = InMemoryAuditStore()
+    service = SafeToolService(
+        workspace_root=workspace,
+        risk_scorer=_RequireApprovalRiskScorer(workspace),
+        audit_store=store,
+    )
+
+    result = service.sentry_write_file(str(outside), "hello")
+
+    assert result.ok is False
+    assert result.decision == "block"
+    assert "path_outside_workspace" in result.reasons
+    assert result.approval_request_id is None
+    assert service.approval_store.list_pending() == []
+    assert not outside.exists()
+
+    events = store.list_events()
+    assert len(events) == 1
+    assert events[0].tool_name == "write_file"
+    assert events[0].decision == "block"
+    assert events[0].executed is False
+    assert "approval_request_created" not in _serialized_events(store)
+
+
+def test_approve_request_boundary_denial_uses_lifecycle_audit(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    other_workspace = tmp_path / "other"
+    workspace.mkdir()
+    other_workspace.mkdir()
+    target = workspace / "notes.txt"
+    store = InMemoryAuditStore()
+    service = SafeToolService(
+        workspace_root=workspace,
+        risk_scorer=_SpyRiskScorer(workspace),
+        audit_store=store,
+    )
+
+    result = service.sentry_write_file(str(target), "hello")
+    assert result.approval_request_id is not None
+    service.workspace_root = other_workspace.resolve()
+
+    approved = service.approve_request(result.approval_request_id)
+
+    assert approved.ok is False
+    assert approved.decision == "block"
+    assert "path_outside_workspace" in approved.reasons
+    assert not target.exists()
+    assert service.approval_store.list_pending() == []
+    assert service.approval_store.get(result.approval_request_id).status == "approved"
+    assert (
+        service.approval_store.get_execution_payload(result.approval_request_id)
+        is None
+    )
+
+    events = store.list_events(limit=1000)
+    assert events[-1].tool_name == "approval_execution_denied"
+    assert events[-1].executed is False
+    assert "path_outside_workspace" in events[-1].model_dump_json()
+
+
+def test_expired_request_cannot_be_approved_and_discards_payload(
+    tmp_path: Path,
+) -> None:
+    service = SafeToolService(workspace_root=tmp_path)
+
+    result = service.sentry_write_file("notes.txt", "hello")
+    assert result.approval_request_id is not None
+    request_id = result.approval_request_id
+    stored_request = service.approval_store._requests[request_id]
+    service.approval_store._requests[request_id] = stored_request.model_copy(
+        update={"expires_at": datetime.now(UTC) - timedelta(seconds=1)},
+        deep=True,
+    )
+
+    approved = service.approve_request(request_id)
+
+    assert approved.ok is False
+    assert approved.decision == "block"
+    assert any("expired" in reason for reason in approved.reasons)
+    assert service.approval_store.get(request_id).status == "expired"
+    assert service.approval_store.get_execution_payload(request_id) is None
+    assert not (tmp_path / "notes.txt").exists()
+
+
+def test_private_payload_cannot_be_replaced_for_existing_request(
+    tmp_path: Path,
+) -> None:
+    service = SafeToolService(workspace_root=tmp_path)
+
+    result = service.sentry_write_file("notes.txt", "hello")
+    assert result.approval_request_id is not None
+
+    with pytest.raises(
+        ApprovalStoreError,
+        match="approval_execution_payload_already_exists",
+    ):
+        service.approval_store.attach_execution_payload(
+            result.approval_request_id,
+            object(),
+        )
+
+
+def test_payload_fingerprint_mismatch_prevents_execution(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryAuditStore()
+    service = SafeToolService(workspace_root=tmp_path, audit_store=store)
+
+    result = service.sentry_write_file("notes.txt", "hello")
+    assert result.approval_request_id is not None
+    payload = service.approval_store.get_execution_payload(result.approval_request_id)
+    assert payload is not None
+    payload.arguments["path"] = "tampered.txt"
+
+    approved = service.approve_request(result.approval_request_id)
+
+    assert approved.ok is False
+    assert approved.decision == "block"
+    assert "approval_payload_mismatch" in approved.reasons
+    assert not (tmp_path / "notes.txt").exists()
+    assert not (tmp_path / "tampered.txt").exists()
+    assert service.approval_store.get(result.approval_request_id).status == "approved"
+    assert (
+        service.approval_store.get_execution_payload(result.approval_request_id)
+        is None
+    )
+    serialized_events = _serialized_events(store)
+    assert "approval_execution_denied" in serialized_events
+    assert "approval_payload_mismatch" in serialized_events
 
 
 def test_blocked_operations_do_not_create_approval_requests(tmp_path: Path) -> None:
