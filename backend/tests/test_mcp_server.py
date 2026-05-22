@@ -9,16 +9,22 @@ from app.audit.jsonl_store import JsonlAuditStore
 from app.audit.store import InMemoryAuditStore
 from app.mcp import server
 from app.mcp.server import (
+    APPROVAL_API_HOST,
+    APPROVAL_API_PORT_ENV,
     AUDIT_LOG_PATH_ENV,
+    INVALID_APPROVAL_API_PORT_ERROR,
     MISSING_WORKSPACE_ROOT_ERROR,
     WORKSPACE_ROOT_ENV,
+    ApprovalApiPortError,
     WorkspaceRootError,
     create_mcp_server,
     create_service,
     main,
+    resolve_approval_api_port,
     resolve_audit_log_path,
     resolve_workspace_root,
     serialize_result,
+    start_approval_api_server,
 )
 from app.privacy.masker import MaskingFinding
 from app.privacy.patterns import SecretKind
@@ -184,6 +190,41 @@ def test_resolve_audit_log_path_treats_blank_values_as_missing(
     monkeypatch.setenv(AUDIT_LOG_PATH_ENV, "   ")
 
     assert resolve_audit_log_path(" ") is None
+
+
+def test_resolve_approval_api_port_uses_cli_before_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(APPROVAL_API_PORT_ENV, "8767")
+
+    assert resolve_approval_api_port("8766") == 8766
+
+
+def test_resolve_approval_api_port_uses_env_when_cli_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(APPROVAL_API_PORT_ENV, "8766")
+
+    assert resolve_approval_api_port(None) == 8766
+
+
+def test_resolve_approval_api_port_treats_blank_values_as_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(APPROVAL_API_PORT_ENV, "   ")
+
+    assert resolve_approval_api_port(" ") is None
+
+
+@pytest.mark.parametrize("value", ["0", "65536", "abc"])
+def test_resolve_approval_api_port_rejects_invalid_values(
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(APPROVAL_API_PORT_ENV, raising=False)
+
+    with pytest.raises(ApprovalApiPortError, match=INVALID_APPROVAL_API_PORT_ERROR):
+        resolve_approval_api_port(value)
 
 
 def test_create_service_passes_explicit_workspace_root(tmp_path: Path) -> None:
@@ -396,6 +437,87 @@ def test_main_uses_injected_runner_without_blocking(
     assert len(ran_servers) == 1
 
 
+def test_main_does_not_start_approval_api_without_port(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ran_servers: list[object] = []
+    monkeypatch.delenv(WORKSPACE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(APPROVAL_API_PORT_ENV, raising=False)
+
+    def fail_start_approval_api(service: SafeToolService, port: int) -> object:
+        raise AssertionError("approval API should be disabled by default")
+
+    monkeypatch.setattr(
+        server,
+        "start_approval_api_server",
+        fail_start_approval_api,
+    )
+
+    exit_code = main(
+        ["--workspace-root", str(tmp_path)],
+        server_runner=ran_servers.append,
+    )
+
+    assert exit_code == 0
+    assert len(ran_servers) == 1
+
+
+def test_main_starts_approval_api_with_same_safe_tool_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ran_servers: list[object] = []
+    started: list[tuple[SafeToolService, int]] = []
+    service = SafeToolService(workspace_root=tmp_path)
+    monkeypatch.delenv(WORKSPACE_ROOT_ENV, raising=False)
+
+    def fake_create_service(
+        workspace_root: Path,
+        audit_log_path: str | Path | None = None,
+    ) -> SafeToolService:
+        assert workspace_root == tmp_path.resolve()
+        assert audit_log_path is None
+        return service
+
+    def fake_start_approval_api(
+        safe_tool_service: SafeToolService,
+        port: int,
+    ) -> object:
+        started.append((safe_tool_service, port))
+        return object()
+
+    monkeypatch.setattr(server, "create_service", fake_create_service)
+    monkeypatch.setattr(server, "start_approval_api_server", fake_start_approval_api)
+
+    exit_code = main(
+        ["--workspace-root", str(tmp_path), "--approval-api-port", "8766"],
+        server_runner=ran_servers.append,
+    )
+
+    assert exit_code == 0
+    assert started == [(service, 8766)]
+    assert len(ran_servers) == 1
+
+
+def test_main_rejects_invalid_approval_api_port(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv(WORKSPACE_ROOT_ENV, raising=False)
+
+    exit_code = main(
+        ["--workspace-root", str(tmp_path), "--approval-api-port", "70000"],
+        server_runner=lambda mcp: None,
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert INVALID_APPROVAL_API_PORT_ERROR in captured.err
+
+
 def test_mcp_server_with_real_safe_tool_service_masks_secrets_and_blocks_env(
     tmp_path: Path,
 ) -> None:
@@ -422,6 +544,45 @@ def test_mcp_server_with_real_safe_tool_service_masks_secrets_and_blocks_env(
     assert env_result["decision"] == "block"
     assert env_result["ok"] is False
     assert raw_secret not in json.dumps(env_result)
+
+
+def test_start_approval_api_server_binds_only_to_localhost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uvicorn
+
+    captured: dict[str, object] = {}
+
+    class _RecordingConfig:
+        def __init__(self, app: object, host: str, port: int) -> None:
+            captured["app"] = app
+            captured["host"] = host
+            captured["port"] = port
+            self.host = host
+            self.port = port
+
+    class _RecordingServer:
+        def __init__(self, config: _RecordingConfig) -> None:
+            captured["server_host"] = config.host
+            captured["server_port"] = config.port
+
+        def run(self) -> None:
+            captured["ran"] = True
+
+    monkeypatch.setattr(uvicorn, "Config", _RecordingConfig)
+    monkeypatch.setattr(uvicorn, "Server", _RecordingServer)
+
+    service = SafeToolService(workspace_root=tmp_path)
+    thread = start_approval_api_server(service, port=8766)
+    thread.join(timeout=2.0)
+
+    assert thread.is_alive() is False
+    assert APPROVAL_API_HOST == "127.0.0.1"
+    assert captured["host"] == "127.0.0.1"
+    assert captured["server_host"] == "127.0.0.1"
+    assert captured["port"] == 8766
+    assert captured.get("ran") is True
 
 
 def _call_tool(
