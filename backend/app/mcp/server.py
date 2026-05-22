@@ -1,10 +1,12 @@
 import argparse
 import os
+import socket
 import sys
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import cast
+from time import monotonic, sleep
+from typing import Protocol, cast
 
 from mcp.server.fastmcp import FastMCP
 
@@ -17,6 +19,7 @@ WORKSPACE_ROOT_ENV = "SENTRYGATE_WORKSPACE_ROOT"
 AUDIT_LOG_PATH_ENV = "SENTRYGATE_AUDIT_LOG_PATH"
 APPROVAL_API_PORT_ENV = "SENTRYGATE_APPROVAL_API_PORT"
 APPROVAL_API_HOST = "127.0.0.1"
+APPROVAL_API_STARTUP_TIMEOUT_SECONDS = 5.0
 MISSING_WORKSPACE_ROOT_ERROR = (
     "SENTRYGATE_WORKSPACE_ROOT or --workspace-root is required"
 )
@@ -32,6 +35,22 @@ class WorkspaceRootError(ValueError):
 
 class ApprovalApiPortError(ValueError):
     pass
+
+
+class ApprovalApiStartupError(RuntimeError):
+    pass
+
+
+class _ApprovalApiConfig(Protocol):
+    port: int
+
+
+class _ApprovalApiServer(Protocol):
+    config: _ApprovalApiConfig
+    started: bool
+
+    def run(self) -> None:
+        pass
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -174,26 +193,47 @@ def run_mcp_server(mcp: FastMCP) -> None:
     mcp.run()
 
 
+def ensure_approval_api_port_available(
+    port: int,
+    host: str = APPROVAL_API_HOST,
+) -> None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, port))
+    except OSError as error:
+        raise ApprovalApiStartupError(
+            f"approval API port unavailable on {host}:{port}: "
+            f"{_safe_exception_summary(error)}"
+        ) from None
+
+
 def start_approval_api_server(
     service: SafeToolService,
     port: int,
 ) -> threading.Thread:
     import uvicorn
 
+    _log_stderr(f"approval API start attempted on {APPROVAL_API_HOST}:{port}")
+    ensure_approval_api_port_available(port)
+
     app = create_approval_api(service)
-    config = uvicorn.Config(app, host=APPROVAL_API_HOST, port=port)
-    api_server = uvicorn.Server(config)
+    config = uvicorn.Config(
+        app,
+        host=APPROVAL_API_HOST,
+        port=port,
+        access_log=False,
+    )
+    api_server = cast(_ApprovalApiServer, uvicorn.Server(config))
+    startup_errors: list[BaseException] = []
     thread = threading.Thread(
-        target=api_server.run,
+        target=_run_approval_api_server,
+        args=(api_server, startup_errors),
         name=f"sentrygate-approval-api-{port}",
         daemon=True,
     )
     thread.start()
-    print(
-        f"approval API started on {APPROVAL_API_HOST}:{port}",
-        file=sys.stderr,
-        flush=True,
-    )
+    _wait_for_approval_api_start(api_server, thread, startup_errors)
+    _log_stderr(f"approval API started on {APPROVAL_API_HOST}:{port}")
     return thread
 
 
@@ -204,17 +244,27 @@ def main(
     args = parse_args(argv)
     try:
         workspace_root = resolve_workspace_root(args.workspace_root)
+        _log_stderr(f"workspace root resolved: {workspace_root}")
         audit_log_path = resolve_audit_log_path(args.audit_log_path)
+        _log_stderr(f"audit log path resolved: {_optional_path(audit_log_path)}")
         approval_api_port = resolve_approval_api_port(args.approval_api_port)
+        _log_stderr(
+            f"approval API port resolved: {_optional_port(approval_api_port)}"
+        )
         service = create_service(workspace_root, audit_log_path=audit_log_path)
     except (WorkspaceRootError, ApprovalApiPortError) as error:
         print(str(error), file=sys.stderr)
         return 1
 
-    if approval_api_port is not None:
-        start_approval_api_server(service, approval_api_port)
+    try:
+        if approval_api_port is not None:
+            start_approval_api_server(service, approval_api_port)
+    except ApprovalApiStartupError as error:
+        print(str(error), file=sys.stderr)
+        return 1
 
     mcp = create_mcp_server(service)
+    _log_stderr("FastMCP server run starting")
     server_runner(mcp)
     return 0
 
@@ -227,6 +277,77 @@ def _first_nonblank(value: str | None) -> str | None:
     if stripped == "":
         return None
     return stripped
+
+
+def _run_approval_api_server(
+    api_server: _ApprovalApiServer,
+    startup_errors: list[BaseException],
+) -> None:
+    try:
+        api_server.run()
+    except (Exception, SystemExit) as error:
+        startup_errors.append(error)
+        _log_stderr(f"approval API thread failed: {_safe_exception_summary(error)}")
+
+
+def _wait_for_approval_api_start(
+    api_server: _ApprovalApiServer,
+    thread: threading.Thread,
+    startup_errors: list[BaseException],
+    timeout_seconds: float = APPROVAL_API_STARTUP_TIMEOUT_SECONDS,
+) -> None:
+    deadline = monotonic() + timeout_seconds
+    while monotonic() < deadline:
+        if api_server.started:
+            return
+        if startup_errors:
+            error = startup_errors[0]
+            port = _approval_api_server_port(api_server)
+            raise ApprovalApiStartupError(
+                f"approval API failed to start on {APPROVAL_API_HOST}:"
+                f"{port}: {_safe_exception_summary(error)}"
+            ) from None
+        if not thread.is_alive():
+            port = _approval_api_server_port(api_server)
+            raise ApprovalApiStartupError(
+                f"approval API stopped before startup on {APPROVAL_API_HOST}:"
+                f"{port}"
+            )
+        sleep(0.01)
+
+    raise ApprovalApiStartupError(
+        f"approval API did not report startup within {timeout_seconds:.1f}s on "
+        f"{APPROVAL_API_HOST}:{_approval_api_server_port(api_server)}"
+    )
+
+
+def _safe_exception_summary(error: BaseException) -> str:
+    if isinstance(error, SystemExit):
+        return f"SystemExit: code={error.code}"
+    if isinstance(error, OSError):
+        message = error.strerror or str(error)
+        return f"{type(error).__name__}: {message}"
+    return type(error).__name__
+
+
+def _approval_api_server_port(api_server: _ApprovalApiServer) -> int:
+    return api_server.config.port
+
+
+def _log_stderr(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def _optional_path(path: Path | None) -> str:
+    if path is None:
+        return "<disabled>"
+    return str(path)
+
+
+def _optional_port(port: int | None) -> str:
+    if port is None:
+        return "<disabled>"
+    return str(port)
 
 
 if __name__ == "__main__":

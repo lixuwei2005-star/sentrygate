@@ -20,6 +20,20 @@ def test_approval_api_health_returns_safe_payload(tmp_path: Path) -> None:
     assert response.json() == {"ok": True, "service": "sentrygate-approval-api"}
 
 
+def test_approval_api_health_allows_127_0_0_1_host_with_port(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(
+        create_approval_api(SafeToolService(workspace_root=tmp_path)),
+        base_url="http://127.0.0.1:8766",
+    )
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "service": "sentrygate-approval-api"}
+
+
 def test_pending_approvals_returns_display_safe_requests(tmp_path: Path) -> None:
     raw_secret = "sk-test123456"
     service = SafeToolService(workspace_root=tmp_path)
@@ -240,6 +254,22 @@ def test_local_guard_allows_localhost_origin(tmp_path: Path) -> None:
     )
 
     assert response.status_code == 200
+
+
+def test_local_guard_allows_streamlit_dashboard_origins(tmp_path: Path) -> None:
+    client = _client(SafeToolService(workspace_root=tmp_path))
+
+    localhost_response = client.get(
+        "/health",
+        headers={"Origin": "http://localhost:8501"},
+    )
+    loopback_response = client.get(
+        "/health",
+        headers={"Origin": "http://127.0.0.1:8501"},
+    )
+
+    assert localhost_response.status_code == 200
+    assert loopback_response.status_code == 200
 
 
 def test_local_guard_allows_127_0_0_1_origin(tmp_path: Path) -> None:

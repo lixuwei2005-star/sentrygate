@@ -1,5 +1,6 @@
 import asyncio
 import json
+import socket
 from pathlib import Path
 from typing import cast
 
@@ -16,9 +17,11 @@ from app.mcp.server import (
     MISSING_WORKSPACE_ROOT_ERROR,
     WORKSPACE_ROOT_ENV,
     ApprovalApiPortError,
+    ApprovalApiStartupError,
     WorkspaceRootError,
     create_mcp_server,
     create_service,
+    ensure_approval_api_port_available,
     main,
     resolve_approval_api_port,
     resolve_audit_log_path,
@@ -424,6 +427,7 @@ def test_main_missing_workspace_writes_error_to_stderr(
 def test_main_uses_injected_runner_without_blocking(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     ran_servers: list[object] = []
     monkeypatch.delenv(WORKSPACE_ROOT_ENV, raising=False)
@@ -435,6 +439,11 @@ def test_main_uses_injected_runner_without_blocking(
 
     assert exit_code == 0
     assert len(ran_servers) == 1
+    captured = capsys.readouterr()
+    assert "workspace root resolved:" in captured.err
+    assert "audit log path resolved: <disabled>" in captured.err
+    assert "approval API port resolved: <disabled>" in captured.err
+    assert "FastMCP server run starting" in captured.err
 
 
 def test_main_does_not_start_approval_api_without_port(
@@ -518,6 +527,52 @@ def test_main_rejects_invalid_approval_api_port(
     assert INVALID_APPROVAL_API_PORT_ERROR in captured.err
 
 
+def test_ensure_approval_api_port_available_rejects_bound_port() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((APPROVAL_API_HOST, 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+
+        with pytest.raises(
+            ApprovalApiStartupError,
+            match=f"approval API port unavailable on {APPROVAL_API_HOST}:{port}",
+        ):
+            ensure_approval_api_port_available(port)
+
+
+def test_main_rejects_unavailable_approval_api_port(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv(WORKSPACE_ROOT_ENV, raising=False)
+    ran_servers: list[object] = []
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((APPROVAL_API_HOST, 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+
+        exit_code = main(
+            [
+                "--workspace-root",
+                str(tmp_path),
+                "--approval-api-port",
+                str(port),
+            ],
+            server_runner=ran_servers.append,
+        )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert ran_servers == []
+    assert (
+        f"approval API port unavailable on {APPROVAL_API_HOST}:{port}"
+        in captured.err
+    )
+    assert "FastMCP server run starting" not in captured.err
+
+
 def test_mcp_server_with_real_safe_tool_service_masks_secrets_and_blocks_env(
     tmp_path: Path,
 ) -> None:
@@ -555,34 +610,89 @@ def test_start_approval_api_server_binds_only_to_localhost(
     captured: dict[str, object] = {}
 
     class _RecordingConfig:
-        def __init__(self, app: object, host: str, port: int) -> None:
+        def __init__(
+            self,
+            app: object,
+            host: str,
+            port: int,
+            access_log: bool,
+        ) -> None:
             captured["app"] = app
             captured["host"] = host
             captured["port"] = port
+            captured["access_log"] = access_log
             self.host = host
             self.port = port
 
     class _RecordingServer:
         def __init__(self, config: _RecordingConfig) -> None:
+            self.config = config
+            self.started = False
             captured["server_host"] = config.host
             captured["server_port"] = config.port
 
         def run(self) -> None:
             captured["ran"] = True
+            self.started = True
 
     monkeypatch.setattr(uvicorn, "Config", _RecordingConfig)
     monkeypatch.setattr(uvicorn, "Server", _RecordingServer)
 
     service = SafeToolService(workspace_root=tmp_path)
-    thread = start_approval_api_server(service, port=8766)
+    port = _free_local_port()
+    thread = start_approval_api_server(service, port=port)
     thread.join(timeout=2.0)
 
     assert thread.is_alive() is False
     assert APPROVAL_API_HOST == "127.0.0.1"
     assert captured["host"] == "127.0.0.1"
     assert captured["server_host"] == "127.0.0.1"
-    assert captured["port"] == 8766
+    assert captured["port"] == port
+    assert captured["access_log"] is False
     assert captured.get("ran") is True
+
+
+def test_start_approval_api_server_logs_thread_startup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import uvicorn
+
+    raw_private_text = "private approval payload"
+
+    class _RecordingConfig:
+        def __init__(
+            self,
+            app: object,
+            host: str,
+            port: int,
+            access_log: bool,
+        ) -> None:
+            self.host = host
+            self.port = port
+
+    class _FailingServer:
+        def __init__(self, config: _RecordingConfig) -> None:
+            self.config = config
+            self.started = False
+
+        def run(self) -> None:
+            raise RuntimeError(f"boom {raw_private_text}")
+
+    monkeypatch.setattr(uvicorn, "Config", _RecordingConfig)
+    monkeypatch.setattr(uvicorn, "Server", _FailingServer)
+
+    service = SafeToolService(workspace_root=tmp_path)
+    port = _free_local_port()
+
+    with pytest.raises(ApprovalApiStartupError):
+        start_approval_api_server(service, port=port)
+
+    captured = capsys.readouterr()
+    assert "approval API start attempted" in captured.err
+    assert "approval API thread failed: RuntimeError" in captured.err
+    assert raw_private_text not in captured.err
 
 
 def _call_tool(
@@ -592,3 +702,9 @@ def _call_tool(
 ) -> dict[str, object]:
     _, structured_result = asyncio.run(mcp.call_tool(name, arguments))
     return cast(dict[str, object], structured_result)
+
+
+def _free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((APPROVAL_API_HOST, 0))
+        return int(sock.getsockname()[1])
