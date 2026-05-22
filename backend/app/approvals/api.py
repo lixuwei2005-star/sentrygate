@@ -1,4 +1,5 @@
 import logging
+import sys
 from collections.abc import Awaitable, Callable
 from typing import cast
 from urllib.parse import urlparse
@@ -42,7 +43,13 @@ def create_approval_api(service: SafeToolService) -> FastAPI:
     @app.get("/approvals/pending", response_model=list[ApprovalRequest])
     def list_pending_approvals() -> list[ApprovalRequest]:
         try:
-            return service.approval_store.list_pending()
+            pending = service.approval_store.list_pending()
+            print(
+                f"approval pending requested: count={len(pending)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return pending
         except Exception as error:
             _log_safe_exception("approval_pending_failed", error)
             raise HTTPException(

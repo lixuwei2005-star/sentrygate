@@ -3,6 +3,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -552,6 +553,13 @@ class SafeToolService:
                     arguments=raw_arguments,
                 ),
             ),
+        )
+        print(
+            "approval request created: "
+            f"request_id={stored_request.request_id}; "
+            f"tool_name={tool_call.tool_name}",
+            file=sys.stderr,
+            flush=True,
         )
 
         error, error_findings = self._mask_text("operation_requires_approval")

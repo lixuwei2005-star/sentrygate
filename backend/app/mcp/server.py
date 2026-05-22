@@ -189,6 +189,11 @@ def start_approval_api_server(
         daemon=True,
     )
     thread.start()
+    print(
+        f"approval API started on {APPROVAL_API_HOST}:{port}",
+        file=sys.stderr,
+        flush=True,
+    )
     return thread
 
 
