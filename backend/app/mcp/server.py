@@ -1,24 +1,36 @@
 import argparse
 import os
 import sys
+import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import cast
 
 from mcp.server.fastmcp import FastMCP
 
+from app.approvals.api import create_approval_api
 from app.audit.jsonl_store import JsonlAuditStore
 from app.tools.models import ToolExecutionResult
 from app.tools.safe_tools import SafeToolService
 
 WORKSPACE_ROOT_ENV = "SENTRYGATE_WORKSPACE_ROOT"
 AUDIT_LOG_PATH_ENV = "SENTRYGATE_AUDIT_LOG_PATH"
+APPROVAL_API_PORT_ENV = "SENTRYGATE_APPROVAL_API_PORT"
+APPROVAL_API_HOST = "127.0.0.1"
 MISSING_WORKSPACE_ROOT_ERROR = (
     "SENTRYGATE_WORKSPACE_ROOT or --workspace-root is required"
+)
+INVALID_APPROVAL_API_PORT_ERROR = (
+    "SENTRYGATE_APPROVAL_API_PORT or --approval-api-port must be an integer "
+    "between 1 and 65535"
 )
 
 
 class WorkspaceRootError(ValueError):
+    pass
+
+
+class ApprovalApiPortError(ValueError):
     pass
 
 
@@ -31,6 +43,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--audit-log-path",
         help="Optional local JSONL audit log path for persistent observability.",
+    )
+    parser.add_argument(
+        "--approval-api-port",
+        help="Optional localhost port for the local approval API.",
     )
     return parser.parse_args(argv)
 
@@ -65,6 +81,27 @@ def resolve_audit_log_path(cli_audit_log_path: str | None = None) -> Path | None
         return None
 
     return Path(audit_log_path).expanduser().resolve(strict=False)
+
+
+def resolve_approval_api_port(
+    cli_approval_api_port: str | None = None,
+) -> int | None:
+    approval_api_port = _first_nonblank(cli_approval_api_port)
+    if approval_api_port is None:
+        approval_api_port = _first_nonblank(os.environ.get(APPROVAL_API_PORT_ENV))
+
+    if approval_api_port is None:
+        return None
+
+    try:
+        port = int(approval_api_port)
+    except ValueError:
+        raise ApprovalApiPortError(INVALID_APPROVAL_API_PORT_ERROR) from None
+
+    if port < 1 or port > 65535:
+        raise ApprovalApiPortError(INVALID_APPROVAL_API_PORT_ERROR)
+
+    return port
 
 
 def create_service(
@@ -137,6 +174,24 @@ def run_mcp_server(mcp: FastMCP) -> None:
     mcp.run()
 
 
+def start_approval_api_server(
+    service: SafeToolService,
+    port: int,
+) -> threading.Thread:
+    import uvicorn
+
+    app = create_approval_api(service)
+    config = uvicorn.Config(app, host=APPROVAL_API_HOST, port=port)
+    api_server = uvicorn.Server(config)
+    thread = threading.Thread(
+        target=api_server.run,
+        name=f"sentrygate-approval-api-{port}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def main(
     argv: Sequence[str] | None = None,
     server_runner: Callable[[FastMCP], None] = run_mcp_server,
@@ -145,10 +200,14 @@ def main(
     try:
         workspace_root = resolve_workspace_root(args.workspace_root)
         audit_log_path = resolve_audit_log_path(args.audit_log_path)
+        approval_api_port = resolve_approval_api_port(args.approval_api_port)
         service = create_service(workspace_root, audit_log_path=audit_log_path)
-    except WorkspaceRootError as error:
+    except (WorkspaceRootError, ApprovalApiPortError) as error:
         print(str(error), file=sys.stderr)
         return 1
+
+    if approval_api_port is not None:
+        start_approval_api_server(service, approval_api_port)
 
     mcp = create_mcp_server(service)
     server_runner(mcp)

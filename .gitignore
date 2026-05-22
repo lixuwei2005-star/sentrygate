@@ -22,3 +22,6 @@ env/
 
 # Claude Code local files
 .claude/
+
+# SentryGate local audit logs
+backend/.sentrygate/

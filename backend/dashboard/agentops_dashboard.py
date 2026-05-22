@@ -22,13 +22,21 @@ import streamlit as st  # noqa: E402
 from app.audit.metrics import summarize_audit_events  # noqa: E402
 from app.audit.models import AuditEvent  # noqa: E402
 from dashboard._data import (  # noqa: E402
+    DEFAULT_APPROVAL_API_BASE_URL,
+    ApprovalApiResponse,
     LoadResult,
+    approve_pending_request,
+    bounded_dashboard_text,
     build_latency_series,
+    build_pending_approvals_dataframe,
     build_recent_events_dataframe,
     build_risk_score_buckets,
+    fetch_pending_approvals,
+    format_approval_label,
     format_event_label,
     has_latency_data,
     load_events,
+    reject_pending_request,
     resolve_audit_log_path,
     sort_events_newest_first,
 )
@@ -36,9 +44,10 @@ from dashboard._data import (  # noqa: E402
 DEFAULT_AUDIT_LOG_PATH = "backend/.sentrygate/audit_events.jsonl"
 BOUNDARY_STATEMENT = "SentryGate only observes MCP-routed tool calls."
 RECENT_EVENTS_LIMIT = 100
+APPROVAL_ACTION_RESULT_KEY = "sentrygate_approval_action_result"
 
 
-def _render_sidebar() -> str:
+def _render_sidebar() -> tuple[str, str]:
     with st.sidebar:
         st.header("SentryGate AgentOps")
         st.caption("Local dashboard prototype")
@@ -47,11 +56,19 @@ def _render_sidebar() -> str:
             value=DEFAULT_AUDIT_LOG_PATH,
             help="JSONL audit log written by SentryGate's JsonlAuditStore.",
         )
+        approval_api_base_url = st.text_input(
+            "Approval API base URL",
+            value=DEFAULT_APPROVAL_API_BASE_URL,
+            help="Local approval API exposed by the SentryGate MCP server.",
+        )
         st.button("Reload")
         st.divider()
         st.caption(BOUNDARY_STATEMENT)
-        st.caption("Read-only view. No MCP calls. No command execution.")
-    return path_input
+        st.caption(
+            "Read-only audit view. Approval actions only call the local "
+            "approval API."
+        )
+    return path_input, approval_api_base_url
 
 
 def _render_status_strip(result: LoadResult) -> None:
@@ -198,13 +215,153 @@ def _render_event_detail(result: LoadResult) -> None:
         st.caption("(none)")
 
 
+def _render_pending_approvals(api_base_url: str) -> None:
+    st.subheader("Pending Approvals")
+    st.caption(
+        "Local prototype controls. The dashboard only calls the configured "
+        "localhost approval API."
+    )
+
+    _render_last_approval_action_result()
+
+    response = fetch_pending_approvals(api_base_url)
+    if not response.ok:
+        st.warning(response.warning or "Approval API unavailable.")
+        return
+
+    approvals = _approval_rows(response.payload)
+    if not approvals:
+        st.info("No pending approvals.")
+        return
+
+    st.dataframe(
+        build_pending_approvals_dataframe(approvals),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    labels = [
+        format_approval_label(approval, index)
+        for index, approval in enumerate(approvals)
+    ]
+    selected_index = st.selectbox(
+        "Review approval request",
+        options=list(range(len(approvals))),
+        format_func=lambda index: labels[index],
+    )
+    if selected_index is None:
+        return
+
+    approval = approvals[selected_index]
+    request_id = str(approval.get("request_id") or "")
+    if request_id == "":
+        st.warning("Approval request is missing a request_id.")
+        return
+
+    detail_cols = st.columns(3)
+    detail_cols[0].markdown(f"**request_id**: `{request_id}`")
+    detail_cols[0].markdown(
+        f"**tool_name**: `{approval.get('tool_name') or '-'}`"
+    )
+    detail_cols[1].markdown(
+        f"**risk_score**: {approval.get('risk_score') or '-'}"
+    )
+    detail_cols[1].markdown(f"**status**: `{approval.get('status') or '-'}`")
+    detail_cols[2].markdown(
+        f"**created_at**: `{approval.get('created_at') or '-'}`"
+    )
+    detail_cols[2].markdown(
+        f"**expires_at**: `{approval.get('expires_at') or '-'}`"
+    )
+
+    st.markdown("**arguments_summary** (display-safe)")
+    st.code(bounded_dashboard_text(approval.get("arguments_summary")))
+
+    reasons = approval.get("reasons")
+    st.markdown("**reasons**")
+    if isinstance(reasons, list) and reasons:
+        for reason in reasons:
+            st.markdown(f"- {reason}")
+    else:
+        st.caption("(none)")
+
+    action_cols = st.columns(2)
+    if action_cols[0].button("Approve", key=f"approve-{request_id}"):
+        _store_approval_action_result(
+            "approve",
+            approve_pending_request(api_base_url, request_id),
+        )
+        st.rerun()
+
+    if action_cols[1].button("Reject", key=f"reject-{request_id}"):
+        _store_approval_action_result(
+            "reject",
+            reject_pending_request(api_base_url, request_id),
+        )
+        st.rerun()
+
+
+def _store_approval_action_result(
+    action: str,
+    response: ApprovalApiResponse,
+) -> None:
+    st.session_state[APPROVAL_ACTION_RESULT_KEY] = {
+        "action": action,
+        "ok": response.ok,
+        "warning": response.warning,
+        "payload": response.payload,
+    }
+
+
+def _render_last_approval_action_result() -> None:
+    result = st.session_state.get(APPROVAL_ACTION_RESULT_KEY)
+    if not isinstance(result, dict):
+        return
+
+    action = str(result.get("action") or "approval")
+    if result.get("ok") is not True:
+        st.warning(str(result.get("warning") or "Approval action failed."))
+        return
+
+    payload = result.get("payload")
+    if action == "approve" and isinstance(payload, dict):
+        ok_value = payload.get("ok")
+        decision = payload.get("decision")
+        error = payload.get("error")
+        output = bounded_dashboard_text(payload.get("output"), limit=600)
+        st.success(f"Approve completed: ok={ok_value}; decision={decision}")
+        if error:
+            st.caption(f"error: {bounded_dashboard_text(error, limit=240)}")
+        if output:
+            st.code(output)
+        return
+
+    if action == "reject" and isinstance(payload, dict):
+        status_text = payload.get("status") or "rejected"
+        st.success(f"Reject completed: status={status_text}")
+        return
+
+    st.success("Approval action completed.")
+
+
+def _approval_rows(payload: object | None) -> list[dict[str, object]]:
+    if not isinstance(payload, list):
+        return []
+
+    rows: list[dict[str, object]] = []
+    for item in payload:
+        if isinstance(item, dict):
+            rows.append({str(key): value for key, value in item.items()})
+    return rows
+
+
 def render() -> None:
     st.set_page_config(
         page_title="SentryGate AgentOps",
         layout="wide",
     )
 
-    path_input = _render_sidebar()
+    path_input, approval_api_base_url = _render_sidebar()
     path = resolve_audit_log_path(path_input)
     result = load_events(path)
 
@@ -234,6 +391,8 @@ def render() -> None:
 
     st.subheader("Summary")
     _render_summary_cards(result.events)
+
+    _render_pending_approvals(approval_api_base_url)
 
     if len(result.events) == 0:
         return

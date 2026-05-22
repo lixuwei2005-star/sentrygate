@@ -2,18 +2,30 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
+
 from app.audit.models import AuditEvent
 from app.privacy.masker import MaskingFinding
 from app.privacy.patterns import SecretKind
 from dashboard._data import (
+    APPROVAL_API_UNAVAILABLE_MESSAGE,
+    DEFAULT_APPROVAL_API_BASE_URL,
+    PENDING_APPROVAL_COLUMNS,
     RECENT_EVENT_COLUMNS,
+    REJECTED_APPROVAL_API_URL_MESSAGE,
     REJECTED_AUDIT_LOG_PATH_MESSAGE,
+    approve_pending_request,
     build_latency_series,
+    build_pending_approvals_dataframe,
     build_recent_events_dataframe,
     build_risk_score_buckets,
+    fetch_pending_approvals,
+    format_approval_label,
     format_event_label,
     has_latency_data,
     load_events,
+    normalize_approval_api_base_url,
+    reject_pending_request,
     resolve_audit_log_path,
     sort_events_newest_first,
 )
@@ -353,6 +365,203 @@ def test_format_event_label_includes_index_and_metadata() -> None:
     assert "2026-05-17T09:30:00+00:00" in label
 
 
+def test_normalize_approval_api_base_url_accepts_localhost_only() -> None:
+    default = normalize_approval_api_base_url("")
+    localhost = normalize_approval_api_base_url("http://localhost:8766/")
+
+    assert default.accepted is True
+    assert default.base_url == DEFAULT_APPROVAL_API_BASE_URL
+    assert localhost.accepted is True
+    assert localhost.base_url == "http://localhost:8766"
+
+
+def test_normalize_approval_api_base_url_rejects_non_local_urls() -> None:
+    rejected_urls = [
+        "https://127.0.0.1:8766",
+        "http://0.0.0.0:8766",
+        "http://192.168.1.10:8766",
+        "http://example.com:8766",
+        "http://localhost",
+        "http://localhost:0",
+        "http://localhost:8766/path",
+    ]
+
+    for url in rejected_urls:
+        result = normalize_approval_api_base_url(url)
+        assert result.accepted is False
+        assert result.warning == REJECTED_APPROVAL_API_URL_MESSAGE
+
+
+def test_fetch_pending_approvals_calls_local_api() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert str(request.url) == "http://127.0.0.1:8766/approvals/pending"
+        return httpx.Response(200, json=[_approval_payload()])
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        result = fetch_pending_approvals(
+            DEFAULT_APPROVAL_API_BASE_URL,
+            http_client=http_client,
+        )
+
+    assert result.ok is True
+    assert result.payload == [_approval_payload()]
+
+
+def test_approve_pending_request_posts_without_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert str(request.url) == (
+            "http://localhost:8766/approvals/request-1/approve"
+        )
+        assert request.content == b""
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "decision": "require_approval",
+                "risk_score": 50,
+                "reasons": ["write_file_requires_approval"],
+                "output": "write_file succeeded; chars=5",
+                "error": None,
+                "masked_findings": [],
+                "approval_request_id": None,
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        result = approve_pending_request(
+            "http://localhost:8766/",
+            "request-1",
+            http_client=http_client,
+        )
+
+    assert result.ok is True
+    assert isinstance(result.payload, dict)
+    assert result.payload["ok"] is True
+
+
+def test_reject_pending_request_posts_without_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert str(request.url) == (
+            "http://127.0.0.1:8766/approvals/request-1/reject"
+        )
+        assert request.content == b""
+        payload = _approval_payload()
+        payload["status"] = "rejected"
+        return httpx.Response(200, json=payload)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        result = reject_pending_request(
+            DEFAULT_APPROVAL_API_BASE_URL,
+            "request-1",
+            http_client=http_client,
+        )
+
+    assert result.ok is True
+    assert isinstance(result.payload, dict)
+    assert result.payload["status"] == "rejected"
+
+
+def test_approval_api_helper_rejects_non_local_url_without_request() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("non-local approval URL should not be requested")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        result = fetch_pending_approvals(
+            "http://example.com:8766",
+            http_client=http_client,
+        )
+
+    assert result.ok is False
+    assert result.warning == REJECTED_APPROVAL_API_URL_MESSAGE
+
+
+def test_approval_api_connection_errors_are_safe() -> None:
+    raw_secret = "sk-test123456"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            f"cannot connect {raw_secret} Traceback",
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        result = fetch_pending_approvals(
+            DEFAULT_APPROVAL_API_BASE_URL,
+            http_client=http_client,
+        )
+
+    assert result.ok is False
+    assert result.warning == APPROVAL_API_UNAVAILABLE_MESSAGE
+    assert raw_secret not in str(result)
+    assert "Traceback" not in str(result)
+
+
+def test_approval_api_http_errors_show_safe_detail_only() -> None:
+    raw_secret = "sk-test123456"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={"detail": "approval_request_not_pending"},
+            content=None,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        result = reject_pending_request(
+            DEFAULT_APPROVAL_API_BASE_URL,
+            "request-1",
+            http_client=http_client,
+        )
+
+    assert result.ok is False
+    assert result.warning == (
+        "Approval API returned HTTP 409: approval_request_not_pending"
+    )
+    assert raw_secret not in str(result)
+
+
+def test_approval_api_invalid_json_is_safe() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not-json")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        result = fetch_pending_approvals(
+            DEFAULT_APPROVAL_API_BASE_URL,
+            http_client=http_client,
+        )
+
+    assert result.ok is False
+    assert result.warning == "Approval API returned invalid JSON."
+
+
+def test_build_pending_approvals_dataframe_formats_rows() -> None:
+    frame = build_pending_approvals_dataframe([_approval_payload()])
+
+    assert list(frame.columns) == list(PENDING_APPROVAL_COLUMNS)
+    assert frame.iloc[0]["request_id"] == "request-1"
+    assert frame.iloc[0]["tool_name"] == "write_file"
+    assert frame.iloc[0]["reasons"] == "write_file_requires_approval"
+
+
+def test_build_pending_approvals_dataframe_empty_returns_empty_frame() -> None:
+    frame = build_pending_approvals_dataframe([])
+
+    assert list(frame.columns) == list(PENDING_APPROVAL_COLUMNS)
+    assert len(frame) == 0
+
+
+def test_format_approval_label_includes_index_and_metadata() -> None:
+    label = format_approval_label(_approval_payload(), index=1)
+
+    assert label.startswith("#2 ")
+    assert "write_file" in label
+    assert "risk=50" in label
+    assert "request-" in label
+
+
 def _event(
     tool_name: str,
     decision: str,
@@ -391,3 +600,18 @@ def _audit_log_path(
     log_path = tmp_path / ".sentrygate" / name
     log_path.parent.mkdir(parents=True, exist_ok=True)
     return log_path
+
+
+def _approval_payload() -> dict[str, object]:
+    return {
+        "request_id": "request-1",
+        "created_at": "2026-05-22T00:00:00+00:00",
+        "session_id": "session-1",
+        "tool_name": "write_file",
+        "arguments_summary": "path=notes.txt; content_chars=5",
+        "original_arguments": {"path": "notes.txt", "content_chars": 5},
+        "risk_score": 50,
+        "reasons": ["write_file_requires_approval"],
+        "status": "pending",
+        "expires_at": "2026-05-22T00:30:00+00:00",
+    }
