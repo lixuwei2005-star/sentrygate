@@ -59,6 +59,37 @@ uv run python scripts/demo_sentrygate.py
 - 可选的本地 LM Studio 语义复核层，仅在配置后用于符合条件的中风险调用；
   它不能覆盖确定性的硬阻断规则。
 
+## 隐私脱敏流程
+
+在一次正常允许的文件读取流程中，SentryGate 不会立刻把原始文件内容返回给
+Codex。比如，当 Codex 调用 `sentry_read_file("README.md")` 时，SentryGate
+会先检查路径；只有请求被允许后才读取文件，然后在返回结果前扫描内容中的敏感
+模式。
+
+```text
+Codex 调用 sentry_read_file("README.md")
+↓
+RiskScorer 检查路径
+↓
+README.md 被允许读取
+↓
+SafeToolService 读取文件
+↓
+PrivacyMasker 扫描内容
+↓
+邮箱 / API key 模式被替换为稳定 token
+↓
+Codex 收到脱敏后的输出
+```
+
+输入请求：
+
+![SentryGate 隐私脱敏输入请求](docs/assets/privacy-mask-input.png)
+
+脱敏输出：
+
+![SentryGate 隐私脱敏输出](docs/assets/privacy-mask-output.png)
+
 ## 它保护什么
 
 SentryGate 只保护经过 SentryGate MCP Server 路由的工具调用。
