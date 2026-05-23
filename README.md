@@ -56,6 +56,44 @@ Current implemented pieces:
 This project is designed as an internship portfolio project and local prototype,
 not as a production security product.
 
+## Privacy Masking Flow
+
+During a normal allowed file-read flow, SentryGate does not return raw file
+content immediately. For example, when Codex calls
+`sentry_read_file("README.md")`, the path is checked first, the file is read
+only after the request is allowed, and then the response is scanned for
+sensitive patterns before Codex receives it.
+
+```text
+Codex calls sentry_read_file("README.md")
+|
+v
+RiskScorer checks the path
+|
+v
+README.md is allowed
+|
+v
+SafeToolService reads the file
+|
+v
+PrivacyMasker scans the content
+|
+v
+Email / API key patterns are replaced with stable tokens
+|
+v
+Codex receives the masked output
+```
+
+Input request:
+
+![SentryGate privacy masking input request](docs/assets/privacy-mask-input.png)
+
+Masked output:
+
+![SentryGate privacy masking output](docs/assets/privacy-mask-output.png)
+
 ## What It Protects
 
 SentryGate protects tool calls routed through the SentryGate MCP server.
